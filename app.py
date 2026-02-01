@@ -1,221 +1,556 @@
 import os
-import json
 import re
+import json
 import time
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, send_file, flash
-from flask_cors import CORS
-from twilio.rest import Client
-from dotenv import load_dotenv
+import io
 import csv
+from datetime import datetime, timezone
+
+from flask import Flask, request, render_template, redirect, url_for, flash, send_file
+from flask_cors import CORS
+from dotenv import load_dotenv
+from twilio.rest import Client
+
+from flask_sqlalchemy import SQLAlchemy
 
 load_dotenv()
 
-ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-FLOW_SID = os.getenv("TWILIO_STUDIO_FLOW_SID", "")
-FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")  # E.164 (+52...)
-DEMO_PASSCODE = os.getenv("DEMO_PASSCODE", "").strip()
+# =========================
+# Environment / Config
+# =========================
+ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+DEFAULT_FLOW_SID = os.getenv("TWILIO_STUDIO_FLOW_SID", "").strip()
+DEFAULT_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
 
-# CORS: permite que la UI (Bolt/Lovable) llame a este backend
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip()
+DEMO_PASSCODE = (os.getenv("DEMO_PASSCODE", "") or "").strip()
+FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 
-# Controles operativos (para evitar accidentes)
-MAX_CALLS_PER_REQUEST = int(os.getenv("MAX_CALLS_PER_REQUEST", "1000"))  # ajustable
-CALLS_PER_SECOND = float(os.getenv("CALLS_PER_SECOND", "1"))  # ritmo de arranque (honesto y controlado)
+# Optional secret for Studio webhook (recommended once you get Studio access)
+STUDIO_WEBHOOK_SECRET = (os.getenv("STUDIO_WEBHOOK_SECRET", "") or "").strip()
 
+MAX_CALLS_PER_REQUEST = int(os.getenv("MAX_CALLS_PER_REQUEST", "1000"))
+CALLS_PER_SECOND = float(os.getenv("CALLS_PER_SECOND", "1"))
+
+# Render gives DATABASE_URL for Postgres if you configure it
+DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
+
+# SQLAlchemy expects "postgresql://", Render sometimes provides "postgres://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Fallback local DB if DATABASE_URL not set (useful for local dev)
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///local.db"
+
+# =========================
+# App init
+# =========================
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET", "secret-demo-key")
+app.secret_key = os.getenv("FLASK_SECRET", "change-me")
 
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# CORS for browser clients (Bolt/Lovable)
+cors_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else "*"
 CORS(app, resources={
-    r"/call": {"origins": [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else "*"},
-    r"/studio-webhook": {"origins": [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else "*"},
-}, methods=["POST", "OPTIONS"])
+    r"/call": {"origins": cors_origins},
+    r"/auth-check": {"origins": cors_origins},
+    r"/api/*": {"origins": cors_origins},
+    r"/studio-webhook": {"origins": "*"},  # Studio comes from Twilio; keep open but protect via secret below
+}, methods=["GET", "POST", "OPTIONS"])
 
-client = None
-if ACCOUNT_SID and AUTH_TOKEN:
-    client = Client(ACCOUNT_SID, AUTH_TOKEN)
+twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN) if (ACCOUNT_SID and AUTH_TOKEN) else None
 
-RESP_FILE = os.path.join(os.path.dirname(__file__), "survey_responses.csv")
-if not os.path.exists(RESP_FILE):
-    with open(RESP_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "to", "campaign_id", "received", "rating", "comment_url", "call_sid", "raw"])
 
-E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+# =========================
+# DB Models
+# =========================
+def utcnow():
+    return datetime.now(timezone.utc)
 
-def parse_numbers(raw):
+class Launch(db.Model):
+    __tablename__ = "launches"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime(timezone=True), default=utcnow, index=True, nullable=False)
+    campaign_id = db.Column(db.String(128), index=True, nullable=False)
+    flow_sid = db.Column(db.String(64), index=True, nullable=True)
+    execution_sid = db.Column(db.String(64), index=True, nullable=True)
+    to_number = db.Column(db.String(32), index=True, nullable=False)
+    from_number = db.Column(db.String(32), nullable=True)
+
+class Result(db.Model):
+    __tablename__ = "results"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime(timezone=True), default=utcnow, index=True, nullable=False)
+    campaign_id = db.Column(db.String(128), index=True, nullable=False)
+    flow_sid = db.Column(db.String(64), index=True, nullable=True)
+    execution_sid = db.Column(db.String(64), index=True, nullable=True)
+    call_sid = db.Column(db.String(64), index=True, nullable=True)
+    to_number = db.Column(db.String(32), index=True, nullable=True)
+    answers_json = db.Column(db.Text, nullable=False, default="{}")  # flexible q1..qN
+    raw_json = db.Column(db.Text, nullable=False, default="{}")      # full payload
+
+
+with app.app_context():
+    db.create_all()
+
+
+# =========================
+# Helpers
+# =========================
+def require_passcode(payload: dict):
     """
-    Acepta string con líneas o lista.
-    Regresa (valid_numbers, invalid_numbers)
-    """
-    if raw is None:
-        return [], []
-    if isinstance(raw, list):
-        lines = [str(x) for x in raw]
-    else:
-        lines = str(raw).splitlines()
-
-    valid = []
-    invalid = []
-    seen = set()
-
-    for line in lines:
-        clean = line.strip()
-        if not clean:
-            continue
-        clean = clean.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-
-        if not E164_RE.match(clean):
-            invalid.append(clean)
-            continue
-
-        if clean not in seen:
-            seen.add(clean)
-            valid.append(clean)
-
-    return valid, invalid
-
-def require_passcode(payload):
-    """
-    Si DEMO_PASSCODE está configurado, exige que venga en payload.passcode o header X-CC-Passcode
+    If DEMO_PASSCODE is set, require:
+      - payload.passcode  OR
+      - header X-CC-Passcode
     """
     if not DEMO_PASSCODE:
-        return None  # no se exige
-    provided = ""
-    if isinstance(payload, dict):
-        provided = (payload.get("passcode") or "").strip()
+        return None
+    provided = (payload.get("passcode") or "").strip()
     if not provided:
         provided = (request.headers.get("X-CC-Passcode", "") or "").strip()
     if provided != DEMO_PASSCODE:
         return {"ok": False, "error": "Passcode inválido"}, 401
     return None
 
-@app.route("/")
+def normalize_mx_number(value: str):
+    """
+    Accept Mexico-only inputs and normalize to E.164:
+      - 10 digits: 5512345678 -> +525512345678
+      - 12 digits starting with 52: 525512345678 -> +525512345678
+      - +52... also ok (we strip to digits then normalize)
+    """
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if not digits:
+        return None
+
+    if len(digits) == 10:
+        digits = "52" + digits
+
+    if len(digits) == 12 and digits.startswith("52"):
+        return "+" + digits
+
+    return None
+
+def parse_numbers(raw):
+    """
+    raw may be:
+      - string with lines
+      - list of strings
+    Returns (valid_e164_list, invalid_list)
+    """
+    if raw is None:
+        return [], []
+
+    if isinstance(raw, list):
+        lines = [str(x) for x in raw]
+    else:
+        lines = str(raw).splitlines()
+
+    valid, invalid, seen = [], [], set()
+    for line in lines:
+        line = (line or "").strip()
+        if not line:
+            continue
+        norm = normalize_mx_number(line)
+        if not norm:
+            invalid.append(line)
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            valid.append(norm)
+
+    return valid, invalid
+
+def safe_json(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+def read_answers(payload: dict):
+    """
+    Flexible answers:
+      - preferred: payload["answers"] (dict)
+      - fallback: any keys like q1,q2,q3...
+    """
+    answers = payload.get("answers")
+    if isinstance(answers, dict):
+        return answers
+
+    # fallback: q1..qN
+    out = {}
+    for k, v in payload.items():
+        if isinstance(k, str) and re.fullmatch(r"q\d+", k.strip().lower()):
+            out[k.strip().lower()] = str(v)
+    return out
+
+
+# =========================
+# Routes
+# =========================
+@app.get("/")
 def index():
-    return render_template("index.html", flow_sid=FLOW_SID, from_number=FROM_NUMBER)
+    # keep your old HTML UI if you want
+    return render_template("index.html", flow_sid=DEFAULT_FLOW_SID, from_number=DEFAULT_FROM_NUMBER)
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.post("/auth-check")
+def auth_check():
+    payload = request.get_json(silent=True) or {}
+    fail = require_passcode(payload)
+    if fail:
+        return fail
+    return {"ok": True}
+
 @app.post("/call")
-def make_calls():
-    if client is None:
-        # Si viene de UI externa, respondemos JSON
-        if request.is_json:
-            return {"ok": False, "error": "Twilio no configurado (faltan credenciales)."}, 500
-        flash("Twilio client not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.", "error")
-        return redirect(url_for("index"))
+def call():
+    if not twilio_client:
+        return {"ok": False, "error": "Twilio no configurado (credenciales faltantes)."}, 500
 
-    # Acepta JSON o form
-    payload = request.get_json(silent=True) or request.form.to_dict(flat=True)
+    payload = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
+    fail = require_passcode(payload)
+    if fail:
+        return fail
 
-    # Seguridad: passcode (si está configurado)
-    pass_fail = require_passcode(payload)
-    if pass_fail:
-        return pass_fail
+    # Allow caller to specify flowSid (scenario C)
+    flow_sid = (payload.get("flow_sid") or payload.get("flowSid") or DEFAULT_FLOW_SID or "").strip()
+    from_number = (payload.get("from_number") or payload.get("fromNumber") or DEFAULT_FROM_NUMBER or "").strip()
 
-    to_numbers_raw = payload.get("to_numbers", "")
-    campaign_id = payload.get("campaign_id", "contact-center-v1")
-    extra_params = payload.get("extra_params", {})
-    from_number = payload.get("from_number") or FROM_NUMBER
+    if not flow_sid:
+        return {"ok": False, "error": "Falta flow_sid (TWILIO_STUDIO_FLOW_SID) o no se envió flow_sid."}, 400
+    if not from_number:
+        return {"ok": False, "error": "Falta from_number (TWILIO_FROM_NUMBER)."}, 400
 
-    # extra_params puede venir como string JSON desde form
+    campaign_id = (payload.get("campaign_id") or payload.get("campaignId") or "contact-center-v1").strip()
+
+    extra_params = payload.get("extra_params") or payload.get("extraParams") or {}
     if isinstance(extra_params, str):
         try:
             extra_params = json.loads(extra_params) if extra_params.strip() else {}
         except Exception as e:
-            if request.is_json:
-                return {"ok": False, "error": f"extra_params debe ser JSON válido: {e}"}, 400
-            flash(f"Extra params must be valid JSON: {e}", "error")
-            return redirect(url_for("index"))
+            return {"ok": False, "error": f"extra_params debe ser JSON válido: {e}"}, 400
+    if not isinstance(extra_params, dict):
+        extra_params = {}
 
-    if not FLOW_SID or not from_number:
-        if request.is_json:
-            return {"ok": False, "error": "Falta FLOW_SID o FROM_NUMBER."}, 500
-        flash("Missing FLOW SID or FROM number. Check your .env", "error")
-        return redirect(url_for("index"))
-
+    to_numbers_raw = payload.get("to_numbers") or payload.get("toNumbers") or ""
     to_numbers, invalid = parse_numbers(to_numbers_raw)
-    if not to_numbers:
-        msg = "No hay números válidos. Usa formato E.164, ej. +521234567890"
-        if request.is_json:
-            return {"ok": False, "error": msg, "invalid": invalid}, 400
-        flash(msg, "error")
-        return redirect(url_for("index"))
 
-    # Control por seguridad operativa (ajustable)
+    if not to_numbers:
+        return {
+            "ok": False,
+            "error": "No hay números válidos. Usa teléfonos MX de 10 dígitos (ej. 5512345678).",
+            "invalid": invalid
+        }, 400
+
     if MAX_CALLS_PER_REQUEST > 0 and len(to_numbers) > MAX_CALLS_PER_REQUEST:
         to_numbers = to_numbers[:MAX_CALLS_PER_REQUEST]
 
-    launched = []
-    failures = []
+    sleep_between = (1.0 / CALLS_PER_SECOND) if (CALLS_PER_SECOND and CALLS_PER_SECOND > 0) else 0
 
-    # Ritmo de arranque (CPS): evita saturar API / carriers
-    sleep_between = 0
-    if CALLS_PER_SECOND and CALLS_PER_SECOND > 0:
-        sleep_between = 1.0 / CALLS_PER_SECOND
+    launched, failures = [], []
 
     for to in to_numbers:
         try:
-            params = {"campaignId": campaign_id, **(extra_params or {})}
-            execution = client.studio.v2.flows(FLOW_SID).executions.create(
+            params = {"campaignId": campaign_id, **extra_params}
+            execution = twilio_client.studio.v2.flows(flow_sid).executions.create(
                 to=to,
                 from_=from_number,
                 parameters=params
             )
-            launched.append({"to": to, "execution_sid": execution.sid})
+
+            db_item = Launch(
+                campaign_id=campaign_id,
+                flow_sid=flow_sid,
+                execution_sid=execution.sid,
+                to_number=to,
+                from_number=from_number
+            )
+            db.session.add(db_item)
+            db.session.commit()
+
+            launched.append({
+                "to": to,
+                "execution_sid": execution.sid
+            })
+
         except Exception as e:
             failures.append({"to": to, "error": str(e)})
 
         if sleep_between:
             time.sleep(sleep_between)
 
-    # Respuesta JSON (para Bolt/Lovable)
-    if request.is_json:
-        return {
-            "ok": True,
-            "campaign_id": campaign_id,
-            "launched_count": len(launched),
-            "failed_count": len(failures),
-            "invalid_count": len(invalid),
-            "invalid": invalid[:50],
-            "launched": launched[:50],
-            "failures": failures[:50]
-        }
-
-    # Respuesta para la UI vieja (Flask HTML)
-    if launched:
-        flash(f"Launched {len(launched)} call(s).", "success")
-    if invalid:
-        flash(f"Se ignoraron {len(invalid)} números inválidos.", "error")
-    if failures:
-        flash("Some calls failed: " + "; ".join([f"{x['to']} -> {x['error']}" for x in failures[:10]]), "error")
-
-    return redirect(url_for("index"))
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "flow_sid": flow_sid,
+        "launched_count": len(launched),
+        "failed_count": len(failures),
+        "invalid_count": len(invalid),
+        "invalid_preview": invalid[:50],
+        "launched_preview": launched[:50],
+        "failures_preview": failures[:50],
+    }
 
 @app.post("/studio-webhook")
 def studio_webhook():
-    payload = request.get_json(silent=True) or request.form.to_dict(flat=True)
+    """
+    Twilio Studio should POST survey results here.
 
-    to = payload.get("to") or payload.get("contact") or ""
-    campaign_id = payload.get("campaignId") or payload.get("campaign_id") or ""
-    received = payload.get("received") or payload.get("recibio") or payload.get("q1") or ""
-    rating = payload.get("rating") or payload.get("q2") or ""
-    comment_url = payload.get("commentUrl") or payload.get("comentario_url") or ""
-    call_sid = payload.get("callSid") or payload.get("CallSid") or ""
-    raw = json.dumps(payload, ensure_ascii=False)
+    Recommended security:
+      - set STUDIO_WEBHOOK_SECRET in Render
+      - configure Studio Make HTTP Request to send header:
+          X-Webhook-Secret: <same value>
+    """
+    if STUDIO_WEBHOOK_SECRET:
+        provided = (request.headers.get("X-Webhook-Secret", "") or "").strip()
+        if provided != STUDIO_WEBHOOK_SECRET:
+            return {"ok": False, "error": "Unauthorized"}, 401
 
-    with open(RESP_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.utcnow().isoformat(), to, campaign_id, received, rating, comment_url, call_sid, raw])
+    payload = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
 
-    return {"status": "ok"}
+    campaign_id = (payload.get("campaignId") or payload.get("campaign_id") or "unknown").strip()
+    flow_sid = (payload.get("flowSid") or payload.get("flow_sid") or "").strip()
+    execution_sid = (payload.get("executionSid") or payload.get("execution_sid") or "").strip()
+    call_sid = (payload.get("callSid") or payload.get("CallSid") or "").strip()
+    to_number = (payload.get("to") or payload.get("To") or payload.get("contact") or "").strip()
 
-@app.get("/download-responses")
-def download_responses():
-    return send_file(RESP_FILE, as_attachment=True, download_name="survey_responses.csv")
+    answers = read_answers(payload)
+
+    row = Result(
+        campaign_id=campaign_id,
+        flow_sid=flow_sid or None,
+        execution_sid=execution_sid or None,
+        call_sid=call_sid or None,
+        to_number=to_number or None,
+        answers_json=safe_json(answers),
+        raw_json=safe_json(payload),
+    )
+    db.session.add(row)
+    db.session.commit()
+
+    return {"ok": True}
+
+@app.get("/api/results")
+def api_results():
+    # protect results behind passcode (called from your UI)
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or request.args.get("campaignId") or "").strip()
+    flow_sid = (request.args.get("flow_sid") or request.args.get("flowSid") or "").strip()
+    limit = int(request.args.get("limit", "200"))
+
+    q = Result.query.order_by(Result.created_at.desc())
+    if campaign_id:
+        q = q.filter(Result.campaign_id == campaign_id)
+    if flow_sid:
+        q = q.filter(Result.flow_sid == flow_sid)
+
+    rows = q.limit(min(limit, 1000)).all()
+
+    out = []
+    for r in rows:
+        try:
+            answers = json.loads(r.answers_json or "{}")
+        except Exception:
+            answers = {}
+        out.append({
+            "id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "campaign_id": r.campaign_id,
+            "flow_sid": r.flow_sid,
+            "execution_sid": r.execution_sid,
+            "call_sid": r.call_sid,
+            "to": r.to_number,
+            "answers": answers,
+        })
+
+    return {"ok": True, "count": len(out), "results": out}
+
+@app.get("/api/summary")
+def api_summary():
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or request.args.get("campaignId") or "").strip()
+    flow_sid = (request.args.get("flow_sid") or request.args.get("flowSid") or "").strip()
+
+    q = Result.query
+    if campaign_id:
+        q = q.filter(Result.campaign_id == campaign_id)
+    if flow_sid:
+        q = q.filter(Result.flow_sid == flow_sid)
+
+    rows = q.all()
+
+    summary = {}  # {q1: { "1": 10, "2": 5 } }
+    total = 0
+
+    for r in rows:
+        total += 1
+        try:
+            answers = json.loads(r.answers_json or "{}")
+        except Exception:
+            answers = {}
+        if not isinstance(answers, dict):
+            continue
+
+        for k, v in answers.items():
+            k = str(k).lower()
+            v = str(v)
+            summary.setdefault(k, {})
+            summary[k][v] = summary[k].get(v, 0) + 1
+
+    return {"ok": True, "total_results": total, "summary": summary}
+
+@app.get("/api/launches")
+def api_launches():
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or request.args.get("campaignId") or "").strip()
+    flow_sid = (request.args.get("flow_sid") or request.args.get("flowSid") or "").strip()
+    limit = int(request.args.get("limit", "200"))
+
+    q = Launch.query.order_by(Launch.created_at.desc())
+    if campaign_id:
+        q = q.filter(Launch.campaign_id == campaign_id)
+    if flow_sid:
+        q = q.filter(Launch.flow_sid == flow_sid)
+
+    rows = q.limit(min(limit, 2000)).all()
+
+    out = [{
+        "id": r.id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "campaign_id": r.campaign_id,
+        "flow_sid": r.flow_sid,
+        "execution_sid": r.execution_sid,
+        "to": r.to_number,
+        "from": r.from_number,
+    } for r in rows]
+
+    return {"ok": True, "count": len(out), "launches": out}
+
+@app.get("/api/twilio-calls")
+def api_twilio_calls():
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    if not twilio_client:
+        return {"ok": False, "error": "Twilio no configurado."}, 500
+
+    limit = int(request.args.get("limit", "50"))
+    try:
+        calls = twilio_client.calls.list(limit=min(limit, 200))
+        items = []
+        for c in calls:
+            items.append({
+                "sid": c.sid,
+                "from": c.from_,
+                "to": c.to,
+                "status": c.status,
+                "start_time": c.start_time.isoformat() if c.start_time else None,
+                "end_time": c.end_time.isoformat() if c.end_time else None,
+                "duration": c.duration,
+                "direction": c.direction,
+            })
+        return {"ok": True, "count": len(items), "calls": items}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+@app.get("/download-results.csv")
+def download_results_csv():
+    # protect behind passcode
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or "").strip()
+    q = Result.query.order_by(Result.created_at.desc())
+    if campaign_id:
+        q = q.filter(Result.campaign_id == campaign_id)
+
+    rows = q.limit(5000).all()
+
+    # Build CSV dynamically with union of question keys
+    all_keys = set()
+    parsed = []
+    for r in rows:
+        try:
+            answers = json.loads(r.answers_json or "{}")
+        except Exception:
+            answers = {}
+        if not isinstance(answers, dict):
+            answers = {}
+        all_keys.update(answers.keys())
+        parsed.append((r, answers))
+
+    qkeys = sorted([str(k) for k in all_keys])
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["created_at", "campaign_id", "flow_sid", "execution_sid", "call_sid", "to"] + qkeys)
+
+    for r, answers in parsed:
+        row = [
+            r.created_at.isoformat() if r.created_at else "",
+            r.campaign_id,
+            r.flow_sid or "",
+            r.execution_sid or "",
+            r.call_sid or "",
+            r.to_number or "",
+        ] + [answers.get(k, "") for k in qkeys]
+        writer.writerow(row)
+
+    mem = io.BytesIO(output.getvalue().encode("utf-8"))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name="results.csv", mimetype="text/csv")
+
+@app.get("/download-launches.csv")
+def download_launches_csv():
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or "").strip()
+    q = Launch.query.order_by(Launch.created_at.desc())
+    if campaign_id:
+        q = q.filter(Launch.campaign_id == campaign_id)
+
+    rows = q.limit(10000).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["created_at", "campaign_id", "flow_sid", "execution_sid", "from", "to"])
+    for r in rows:
+        writer.writerow([
+            r.created_at.isoformat() if r.created_at else "",
+            r.campaign_id,
+            r.flow_sid or "",
+            r.execution_sid or "",
+            r.from_number or "",
+            r.to_number or "",
+        ])
+
+    mem = io.BytesIO(output.getvalue().encode("utf-8"))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name="launches.csv", mimetype="text/csv")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
+

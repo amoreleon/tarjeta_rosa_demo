@@ -189,6 +189,36 @@ def read_answers(payload: dict):
             out[k.strip().lower()] = str(v)
     return out
 
+def _twilio_prop(obj, *keys):
+    """Lee propiedades aunque cambien nombres entre versiones del SDK."""
+    for k in keys:
+        # 1) intentar como atributo directo
+        try:
+            v = getattr(obj, k)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+
+        # 2) intentar desde _properties (raw payload)
+        try:
+            props = getattr(obj, "_properties", None) or {}
+            v = props.get(k)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+
+    return None
+
+def _iso(v):
+    if not v:
+        return None
+    try:
+        return v.isoformat()
+    except Exception:
+        return str(v)
+
 
 # =========================
 # Routes
@@ -457,15 +487,17 @@ def api_twilio_calls():
         calls = twilio_client.calls.list(limit=min(limit, 200))
         items = []
         for c in calls:
+            from_num = _twilio_prop(c, "from_", "from", "from_formatted")
+            to_num = _twilio_prop(c, "to", "to_formatted")
             items.append({
-                "sid": c.sid,
-                "from": c.from_,
-                "to": c.to,
-                "status": c.status,
-                "start_time": c.start_time.isoformat() if c.start_time else None,
-                "end_time": c.end_time.isoformat() if c.end_time else None,
-                "duration": c.duration,
-                "direction": c.direction,
+                "sid": _twilio_prop(c, "sid"),
+                "from": from_num,
+                "to": to_num,
+                "status": _twilio_prop(c, "status"),
+                "start_time": _iso(_twilio_prop(c, "start_time", "date_created")),
+                "end_time": _iso(_twilio_prop(c, "end_time", "date_updated")),
+                "duration": _twilio_prop(c, "duration"),
+                "direction": _twilio_prop(c, "direction"),
             })
         return {"ok": True, "count": len(items), "calls": items}
     except Exception as e:
@@ -553,4 +585,5 @@ def download_launches_csv():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 

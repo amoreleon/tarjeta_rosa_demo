@@ -483,23 +483,39 @@ def api_twilio_calls():
         return {"ok": False, "error": "Twilio no configurado."}, 500
 
     limit = int(request.args.get("limit", "50"))
+
     try:
         calls = twilio_client.calls.list(limit=min(limit, 200))
         items = []
+
         for c in calls:
-            from_num = _twilio_prop(c, "from_", "from", "from_formatted")
-            to_num = _twilio_prop(c, "to", "to_formatted")
+            props = getattr(c, "_properties", {}) or {}
+
+            # En algunas versiones del SDK, "from" no existe como atributo, pero sí en _properties
+            from_num = props.get("from") or props.get("from_") or getattr(c, "from_", None)
+            to_num = props.get("to") or getattr(c, "to", None)
+
+            start_time = getattr(c, "start_time", None) or props.get("start_time")
+            end_time = getattr(c, "end_time", None) or props.get("end_time")
+
+            if hasattr(start_time, "isoformat"):
+                start_time = start_time.isoformat()
+            if hasattr(end_time, "isoformat"):
+                end_time = end_time.isoformat()
+
             items.append({
-                "sid": _twilio_prop(c, "sid"),
+                "sid": getattr(c, "sid", None),
                 "from": from_num,
                 "to": to_num,
-                "status": _twilio_prop(c, "status"),
-                "start_time": _iso(_twilio_prop(c, "start_time", "date_created")),
-                "end_time": _iso(_twilio_prop(c, "end_time", "date_updated")),
-                "duration": _twilio_prop(c, "duration"),
-                "direction": _twilio_prop(c, "direction"),
+                "status": getattr(c, "status", None) or props.get("status"),
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration": getattr(c, "duration", None) or props.get("duration"),
+                "direction": getattr(c, "direction", None) or props.get("direction"),
             })
+
         return {"ok": True, "count": len(items), "calls": items}
+
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 

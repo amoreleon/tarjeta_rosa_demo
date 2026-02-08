@@ -483,41 +483,53 @@ def api_twilio_calls():
         return {"ok": False, "error": "Twilio no configurado."}, 500
 
     limit = int(request.args.get("limit", "50"))
+    # Default elegante: solo outbound-api
+    direction_filter = (request.args.get("direction", "outbound-api") or "").strip()
+    include_inbound = (request.args.get("include_inbound", "false") or "").lower() == "true"
+
+    def pick_attr(obj, *names):
+        for n in names:
+            v = getattr(obj, n, None)
+            if v:
+                return v
+        return None
 
     try:
         calls = twilio_client.calls.list(limit=min(limit, 200))
         items = []
 
         for c in calls:
-            props = getattr(c, "_properties", {}) or {}
+            direction = pick_attr(c, "direction") or ""
 
-            # En algunas versiones del SDK, "from" no existe como atributo, pero sí en _properties
-            from_num = props.get("from") or props.get("from_") or getattr(c, "from_", None)
-            to_num = props.get("to") or getattr(c, "to", None)
+            # filtro elegante
+            if not include_inbound and direction_filter:
+                if direction != direction_filter:
+                    continue
 
-            start_time = getattr(c, "start_time", None) or props.get("start_time")
-            end_time = getattr(c, "end_time", None) or props.get("end_time")
+            from_val = (
+                pick_attr(c, "from_", "from", "from_formatted", "caller", "caller_formatted")
+                or (DEFAULT_FROM_NUMBER if direction == "outbound-api" else None)
+            )
+            to_val = pick_attr(c, "to", "to_formatted")
 
-            if hasattr(start_time, "isoformat"):
-                start_time = start_time.isoformat()
-            if hasattr(end_time, "isoformat"):
-                end_time = end_time.isoformat()
+            start_time = pick_attr(c, "start_time")
+            end_time = pick_attr(c, "end_time")
 
             items.append({
-                "sid": getattr(c, "sid", None),
-                "from": from_num,
-                "to": to_num,
-                "status": getattr(c, "status", None) or props.get("status"),
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration": getattr(c, "duration", None) or props.get("duration"),
-                "direction": getattr(c, "direction", None) or props.get("direction"),
+                "sid": c.sid,
+                "from": from_val,
+                "to": to_val,
+                "status": pick_attr(c, "status"),
+                "start_time": start_time.isoformat() if start_time else None,
+                "end_time": end_time.isoformat() if end_time else None,
+                "duration": pick_attr(c, "duration"),
+                "direction": direction,
             })
 
         return {"ok": True, "count": len(items), "calls": items}
-
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
+
 
 @app.get("/download-results.csv")
 def download_results_csv():

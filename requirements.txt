@@ -6,3 +6,4 @@ gunicorn
 Flask-SQLAlchemy
 SQLAlchemy
 psycopg2-binary
+openpyxl>=3.1.0

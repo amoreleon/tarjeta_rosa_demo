@@ -630,15 +630,38 @@ def api_twilio_calls():
             })
 
         call_sids = [x.get("sid") for x in items if x.get("sid")]
+        to_numbers = list({x.get("to") for x in items if x.get("to")})
+
         overrides = {}
+        campaign_map = {}
+
+        # Primary lookup: CallEvent by call_sid
         if call_sids:
-            rows = CallEvent.query.filter(CallEvent.call_sid.in_(call_sids)).all()
-            overrides = {r.call_sid: r.outcome for r in rows if r.call_sid and r.outcome}
+            ce_rows = CallEvent.query.filter(CallEvent.call_sid.in_(call_sids)).all()
+            overrides = {r.call_sid: r.outcome for r in ce_rows if r.call_sid and r.outcome}
+            campaign_map = {r.call_sid: r.campaign_id for r in ce_rows if r.call_sid and r.campaign_id}
+
+        # Fallback lookup: Launch by to_number (most recent launch per number)
+        # Used when call_sid is missing in CallEvent (e.g. no-answer calls)
+        launch_campaign_by_to = {}
+        if to_numbers:
+            launch_rows = (
+                Launch.query
+                .filter(Launch.to_number.in_(to_numbers))
+                .order_by(Launch.created_at.desc())
+                .all()
+            )
+            for lr in launch_rows:
+                if lr.to_number and lr.to_number not in launch_campaign_by_to:
+                    launch_campaign_by_to[lr.to_number] = lr.campaign_id
 
         for x in items:
             sid = x.get("sid")
             if sid and sid in overrides:
                 x["status"] = overrides[sid]
+            # Use CallEvent campaign_id first, fallback to Launch by to_number
+            campaign_id = (campaign_map.get(sid, "") if sid else "") or launch_campaign_by_to.get(x.get("to"), "")
+            x["campaign_id"] = campaign_id
 
         return {"ok": True, "count": len(items), "calls": items}
 

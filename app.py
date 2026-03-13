@@ -738,22 +738,91 @@ def download_launches_csv():
 
     rows = q.limit(10000).all()
 
+    # Build outcome map from CallEvent by execution_sid
+    execution_sids = [r.execution_sid for r in rows if r.execution_sid]
+    outcome_map = {}
+    duration_map = {}
+    if execution_sids:
+        events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
+        for e in events:
+            if e.execution_sid:
+                outcome_map[e.execution_sid] = e.outcome
+
+    # Build answers map from Result by execution_sid
+    answers_map = {}
+    all_qkeys = set()
+    if execution_sids:
+        results = Result.query.filter(Result.execution_sid.in_(execution_sids)).all()
+        for res in results:
+            try:
+                ans = json.loads(res.answers_json or "{}")
+            except Exception:
+                ans = {}
+            if isinstance(ans, dict):
+                all_qkeys.update(ans.keys())
+                answers_map[res.execution_sid] = ans
+
+    qkeys = sorted([str(k) for k in all_qkeys])
+
+    # Fetch duration from Twilio API for each call_sid
+    call_sid_map = {}
+    if execution_sids:
+        ce_rows = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
+        call_sid_map = {e.execution_sid: e.call_sid for e in ce_rows if e.call_sid}
+
+    duration_map = {}
+    if twilio_client and call_sid_map:
+        for exec_sid, csid in call_sid_map.items():
+            try:
+                call = twilio_client.calls(csid).fetch()
+                duration_map[exec_sid] = call.duration or ""
+            except Exception:
+                duration_map[exec_sid] = ""
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["created_at", "campaign_id", "flow_sid", "execution_sid", "from", "to"])
+
+    # Header — telefono as text trick: prefix with tab so Excel treats as text
+    writer.writerow([
+        "Fecha",
+        "Campaign ID",
+        "De",
+        "Para",
+        "Estatus",
+        "Duracion (seg)",
+        "Execution SID",
+    ] + qkeys)
+
     for r in rows:
+        # Format date legible
+        fecha = ""
+        if r.created_at:
+            # Convert to Mexico City time (UTC-6)
+            from datetime import timedelta
+            mx_time = r.created_at - timedelta(hours=6)
+            fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
+
+        # Phone as text: prefix with = trick for Excel
+        to_text = "="" + (r.to_number or "") + """
+        from_text = "="" + (r.from_number or "") + """
+
+        estatus = outcome_map.get(r.execution_sid, "pendiente")
+        duracion = duration_map.get(r.execution_sid, "")
+        ans = answers_map.get(r.execution_sid, {})
+
         writer.writerow([
-            r.created_at.isoformat() if r.created_at else "",
+            fecha,
             r.campaign_id,
-            r.flow_sid or "",
+            from_text,
+            to_text,
+            estatus,
+            duracion,
             r.execution_sid or "",
-            r.from_number or "",
-            r.to_number or "",
-        ])
+        ] + [ans.get(k, "") for k in qkeys])
 
     mem = io.BytesIO(output.getvalue().encode("utf-8"))
     mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name="launches.csv", mimetype="text/csv")
+    return send_file(mem, as_attachment=True, download_name="historial.csv", mimetype="text/csv")
 
 
 if __name__ == "__main__":

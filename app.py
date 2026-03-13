@@ -641,13 +641,8 @@ def api_twilio_calls():
             overrides = {r.call_sid: r.outcome for r in ce_rows if r.call_sid and r.outcome}
             campaign_map = {r.call_sid: r.campaign_id for r in ce_rows if r.call_sid and r.campaign_id}
 
-        # Lookup 2: Result by call_sid (llamadas completadas con encuesta)
-        result_campaign_map = {}
-        if call_sids:
-            res_rows = Result.query.filter(Result.call_sid.in_(call_sids)).all()
-            result_campaign_map = {r.call_sid: r.campaign_id for r in res_rows if r.call_sid and r.campaign_id}
-
-        # Lookup 3: Launch by to_number (fallback cuando call_sid no existe)
+        # Fallback lookup: Launch by to_number (most recent launch per number)
+        # Used when call_sid is missing in CallEvent (e.g. no-answer calls)
         launch_campaign_by_to = {}
         if to_numbers:
             launch_rows = (
@@ -664,12 +659,8 @@ def api_twilio_calls():
             sid = x.get("sid")
             if sid and sid in overrides:
                 x["status"] = overrides[sid]
-            # Prioridad: CallEvent -> Result -> Launch por to_number
-            campaign_id = (
-                (campaign_map.get(sid, "") if sid else "")
-                or (result_campaign_map.get(sid, "") if sid else "")
-                or launch_campaign_by_to.get(x.get("to"), "")
-            )
+            # Use CallEvent campaign_id first, fallback to Launch by to_number
+            campaign_id = (campaign_map.get(sid, "") if sid else "") or launch_campaign_by_to.get(x.get("to"), "")
             x["campaign_id"] = campaign_id
 
         return {"ok": True, "count": len(items), "calls": items}

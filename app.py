@@ -731,6 +731,15 @@ def download_launches_csv():
     if fail:
         return fail
 
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        from datetime import timedelta
+        use_xlsx = True
+    except ImportError:
+        use_xlsx = False
+
     campaign_id = (request.args.get("campaign_id") or "").strip()
     q = Launch.query.order_by(Launch.created_at.desc())
     if campaign_id:
@@ -738,17 +747,14 @@ def download_launches_csv():
 
     rows = q.limit(10000).all()
 
-    # Build outcome map from CallEvent by execution_sid
     execution_sids = [r.execution_sid for r in rows if r.execution_sid]
     outcome_map = {}
-    duration_map = {}
     if execution_sids:
         events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
         for e in events:
             if e.execution_sid:
                 outcome_map[e.execution_sid] = e.outcome
 
-    # Build answers map from Result by execution_sid
     answers_map = {}
     all_qkeys = set()
     if execution_sids:
@@ -764,7 +770,6 @@ def download_launches_csv():
 
     qkeys = sorted([str(k) for k in all_qkeys])
 
-    # Fetch duration from Twilio API for each call_sid
     call_sid_map = {}
     if execution_sids:
         ce_rows = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
@@ -775,51 +780,80 @@ def download_launches_csv():
         for exec_sid, csid in call_sid_map.items():
             try:
                 call = twilio_client.calls(csid).fetch()
-                duration_map[exec_sid] = call.duration or ""
+                duration_map[exec_sid] = int(call.duration or 0)
             except Exception:
                 duration_map[exec_sid] = ""
 
+    headers = ["Fecha", "Campaign ID", "De", "Para", "Estatus", "Duracion (seg)", "Execution SID"] + qkeys
+
+    if use_xlsx:
+        from datetime import timedelta
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Historial"
+
+        header_fill = PatternFill("solid", start_color="1F4E79")
+        header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+        for col_idx, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for row_idx, r in enumerate(rows, 2):
+            fecha = ""
+            if r.created_at:
+                mx_time = r.created_at - timedelta(hours=6)
+                fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
+
+            estatus = outcome_map.get(r.execution_sid, "pendiente")
+            duracion = duration_map.get(r.execution_sid, "")
+            ans = answers_map.get(r.execution_sid, {})
+
+            row_data = [
+                fecha,
+                r.campaign_id,
+                r.from_number or "",
+                r.to_number or "",
+                estatus,
+                duracion,
+                r.execution_sid or "",
+            ] + [ans.get(k, "") for k in qkeys]
+
+            for col_idx, val in enumerate(row_data, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=str(val) if val != "" else "")
+                cell.font = Font(name="Arial", size=10)
+                if col_idx in (3, 4):
+                    cell.number_format = "@"
+
+        col_widths = [22, 18, 18, 18, 14, 14, 36] + [14] * len(qkeys)
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        mem = io.BytesIO()
+        wb.save(mem)
+        mem.seek(0)
+        fname = "historial_{}.xlsx".format(campaign_id or "all")
+        return send_file(mem, as_attachment=True, download_name=fname,
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Fallback CSV
+    from datetime import timedelta
     output = io.StringIO()
     writer = csv.writer(output)
-
-    # Header — telefono as text trick: prefix with tab so Excel treats as text
-    writer.writerow([
-        "Fecha",
-        "Campaign ID",
-        "De",
-        "Para",
-        "Estatus",
-        "Duracion (seg)",
-        "Execution SID",
-    ] + qkeys)
-
+    writer.writerow(headers)
     for r in rows:
-        # Format date legible
         fecha = ""
         if r.created_at:
-            # Convert to Mexico City time (UTC-6)
-            from datetime import timedelta
             mx_time = r.created_at - timedelta(hours=6)
             fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
-
-        # Phone as text: prefix with = trick for Excel
-        to_text = "="" + (r.to_number or "") + """
-        from_text = "="" + (r.from_number or "") + """
-
         estatus = outcome_map.get(r.execution_sid, "pendiente")
         duracion = duration_map.get(r.execution_sid, "")
         ans = answers_map.get(r.execution_sid, {})
-
         writer.writerow([
-            fecha,
-            r.campaign_id,
-            from_text,
-            to_text,
-            estatus,
-            duracion,
-            r.execution_sid or "",
+            fecha, r.campaign_id, r.from_number or "", r.to_number or "",
+            estatus, duracion, r.execution_sid or "",
         ] + [ans.get(k, "") for k in qkeys])
-
     mem = io.BytesIO(output.getvalue().encode("utf-8"))
     mem.seek(0)
     return send_file(mem, as_attachment=True, download_name="historial.csv", mimetype="text/csv")

@@ -62,7 +62,7 @@ CORS(
         r"/call": {"origins": cors_origins},
         r"/auth-check": {"origins": cors_origins},
         r"/api/*": {"origins": cors_origins},
-        r"/studio-webhook": {"origins": "*"},  # Studio comes from Twilio; keep open but protect via secret below
+        r"/studio-webhook": {"origins": "*"},
     },
     methods=["GET", "POST", "OPTIONS"],
 )
@@ -97,15 +97,11 @@ class Result(db.Model):
     execution_sid = db.Column(db.String(64), index=True, nullable=True)
     call_sid = db.Column(db.String(64), index=True, nullable=True)
     to_number = db.Column(db.String(32), index=True, nullable=True)
-    answers_json = db.Column(db.Text, nullable=False, default="{}")  # flexible q1..qN
-    raw_json = db.Column(db.Text, nullable=False, default="{}")      # full payload
+    answers_json = db.Column(db.Text, nullable=False, default="{}")
+    raw_json = db.Column(db.Text, nullable=False, default="{}")
 
 
 class CallEvent(db.Model):
-    """
-    Tabla para guardar outcome/status reportado por Studio (busy/no-answer/failed/completed).
-    Esto permite que la consola discrimine aunque Twilio Calls API no sea consistente o aunque el UI tenga un default.
-    """
     __tablename__ = "call_events"
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(db.DateTime(timezone=True), default=utcnow, index=True, nullable=False)
@@ -113,14 +109,9 @@ class CallEvent(db.Model):
     campaign_id = db.Column(db.String(128), index=True, nullable=False)
     flow_sid = db.Column(db.String(64), index=True, nullable=True)
     execution_sid = db.Column(db.String(64), index=True, nullable=True)
-
-    # CallSid puede venir vacío en algunos edge cases, pero en la mayoría de casos vendrá.
-    # Unique ayuda a hacer "upsert" manual fácil.
     call_sid = db.Column(db.String(64), index=True, unique=True, nullable=True)
-
     to_number = db.Column(db.String(32), index=True, nullable=True)
 
-    # Usamos estados estilo Twilio para que el frontend no tenga que cambiar:
     # busy, no-answer, failed, completed
     outcome = db.Column(db.String(32), index=True, nullable=False)
     raw_json = db.Column(db.Text, nullable=False, default="{}")
@@ -217,7 +208,6 @@ def read_answers(payload: dict):
     if isinstance(answers, dict):
         return answers
 
-    # fallback: q1..qN
     out = {}
     for k, v in payload.items():
         if isinstance(k, str) and re.fullmatch(r"q\d+", k.strip().lower()):
@@ -225,12 +215,43 @@ def read_answers(payload: dict):
     return out
 
 
+def normalize_outcome(v: str):
+    v = (v or "").strip().lower()
+
+    if v in ("no_answer", "noanswer", "no-answer", "no answer"):
+        return "no-answer"
+    if v in ("busy",):
+        return "busy"
+    if v in ("failed", "call_failed", "call-failed", "error"):
+        return "failed"
+    if v in ("completed", "complete", "survey_result"):
+        return "completed"
+    if v in ("voicemail", "machine"):
+        return "no-answer"
+    return v or "unknown"
+
+
+def find_existing_call_event(call_sid: str, execution_sid: str):
+    existing = None
+
+    if call_sid:
+        existing = CallEvent.query.filter(CallEvent.call_sid == call_sid).first()
+        if existing:
+            return existing
+
+    if execution_sid:
+        existing = CallEvent.query.filter(CallEvent.execution_sid == execution_sid).first()
+        if existing:
+            return existing
+
+    return None
+
+
 # =========================
 # Routes
 # =========================
 @app.get("/")
 def index():
-    # keep your old HTML UI if you want
     return render_template("index.html", flow_sid=DEFAULT_FLOW_SID, from_number=DEFAULT_FROM_NUMBER)
 
 
@@ -258,7 +279,6 @@ def call():
     if fail:
         return fail
 
-    # Allow caller to specify flowSid (scenario C)
     flow_sid = (payload.get("flow_sid") or payload.get("flowSid") or DEFAULT_FLOW_SID or "").strip()
     from_number = (payload.get("from_number") or payload.get("fromNumber") or DEFAULT_FROM_NUMBER or "").strip()
 
@@ -340,14 +360,6 @@ def call():
 
 @app.post("/studio-webhook")
 def studio_webhook():
-    """
-    Studio envía resultados aquí.
-
-    Seguridad recomendada:
-      - set STUDIO_WEBHOOK_SECRET en Render
-      - en Studio Make HTTP Request: header
-          X-Webhook-Secret: <mismo valor>
-    """
     if STUDIO_WEBHOOK_SECRET:
         provided = (request.headers.get("X-Webhook-Secret", "") or "").strip()
         if provided != STUDIO_WEBHOOK_SECRET:
@@ -355,45 +367,29 @@ def studio_webhook():
 
     payload = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
 
-    event = (payload.get("event") or "").strip().lower()  # "survey_result" | "call_result" (o vacío legacy)
-
+    event = (payload.get("event") or "").strip().lower()
     campaign_id = (payload.get("campaignId") or payload.get("campaign_id") or "unknown").strip()
     flow_sid = (payload.get("flowSid") or payload.get("flow_sid") or "").strip()
     execution_sid = (payload.get("executionSid") or payload.get("execution_sid") or "").strip()
     call_sid = (payload.get("callSid") or payload.get("CallSid") or "").strip()
     to_number = (payload.get("to") or payload.get("To") or payload.get("contact") or "").strip()
+    raw_outcome = (payload.get("callOutcome") or payload.get("call_outcome") or "").strip()
 
-    def normalize_outcome(v: str):
-        """
-        Normaliza outcomes para que el frontend pueda mapear igual que Twilio:
-          busy, no-answer, failed, completed
-        """
-        v = (v or "").strip().lower()
+    app.logger.info(
+        "studio_webhook event=%s campaign=%s flow=%s execution=%s call=%s to=%s outcome=%s",
+        event,
+        campaign_id,
+        flow_sid,
+        execution_sid,
+        call_sid,
+        to_number,
+        raw_outcome,
+    )
 
-        # variantes comunes
-        if v in ("no_answer", "noanswer", "no-answer", "no answer"):
-            return "no-answer"
-        if v in ("busy",):
-            return "busy"
-        if v in ("failed", "call_failed", "call-failed", "error"):
-            return "failed"
-        if v in ("completed", "complete", "survey_result"):
-            return "completed"
-        if v in ("voicemail", "machine"):
-            # normalmente quieres contar buzón como "sin respuesta"
-            return "no-answer"
-        return v or "unknown"
-
-    # =========================
-    # 1) call_result (busy/no-answer/failed)
-    # =========================
+    # 1) call_result
     if event == "call_result":
-        call_outcome = normalize_outcome(payload.get("callOutcome") or payload.get("call_outcome"))
-
-        # Upsert manual por call_sid cuando exista
-        existing = None
-        if call_sid:
-            existing = CallEvent.query.filter(CallEvent.call_sid == call_sid).first()
+        call_outcome = normalize_outcome(raw_outcome)
+        existing = find_existing_call_event(call_sid, execution_sid)
 
         if existing:
             existing.outcome = call_outcome
@@ -402,6 +398,8 @@ def studio_webhook():
             existing.flow_sid = flow_sid or existing.flow_sid
             existing.execution_sid = execution_sid or existing.execution_sid
             existing.to_number = to_number or existing.to_number
+            if call_sid and not existing.call_sid:
+                existing.call_sid = call_sid
         else:
             db.session.add(CallEvent(
                 campaign_id=campaign_id,
@@ -416,9 +414,7 @@ def studio_webhook():
         db.session.commit()
         return {"ok": True}
 
-    # =========================
-    # 2) survey_result (respuestas)
-    # =========================
+    # 2) survey_result (o legado sin event)
     answers = read_answers(payload)
 
     row = Result(
@@ -432,18 +428,18 @@ def studio_webhook():
     )
     db.session.add(row)
 
-    # Además marcamos outcome=completed (upsert)
-    existing = None
-    if call_sid:
-        existing = CallEvent.query.filter(CallEvent.call_sid == call_sid).first()
+    survey_outcome = normalize_outcome(raw_outcome or "completed")
+    existing = find_existing_call_event(call_sid, execution_sid)
 
     if existing:
-        existing.outcome = "completed"
+        existing.outcome = survey_outcome
         existing.raw_json = safe_json(payload)
         existing.campaign_id = campaign_id
         existing.flow_sid = flow_sid or existing.flow_sid
         existing.execution_sid = execution_sid or existing.execution_sid
         existing.to_number = to_number or existing.to_number
+        if call_sid and not existing.call_sid:
+            existing.call_sid = call_sid
     else:
         db.session.add(CallEvent(
             campaign_id=campaign_id,
@@ -451,7 +447,7 @@ def studio_webhook():
             execution_sid=execution_sid or None,
             call_sid=call_sid or None,
             to_number=to_number or None,
-            outcome="completed",
+            outcome=survey_outcome,
             raw_json=safe_json(payload),
         ))
 
@@ -461,7 +457,6 @@ def studio_webhook():
 
 @app.get("/api/results")
 def api_results():
-    # protect results behind passcode (called from your UI)
     fail = require_passcode(request.args.to_dict(flat=True))
     if fail:
         return fail
@@ -515,7 +510,7 @@ def api_summary():
 
     rows = q.all()
 
-    summary = {}  # {q1: { "1": 10, "2": 5 } }
+    summary = {}
     total = 0
 
     for r in rows:
@@ -577,7 +572,6 @@ def api_twilio_calls():
         return {"ok": False, "error": "Twilio no configurado."}, 500
 
     limit = int(request.args.get("limit", "50"))
-    # Default elegante: solo outbound-api
     direction_filter = (request.args.get("direction", "outbound-api") or "").strip()
     include_inbound = (request.args.get("include_inbound", "false") or "").lower() == "true"
 
@@ -595,7 +589,6 @@ def api_twilio_calls():
         for c in calls:
             direction = pick_attr(c, "direction") or ""
 
-            # filtro elegante
             if not include_inbound and direction_filter:
                 if direction != direction_filter:
                     continue
@@ -620,7 +613,6 @@ def api_twilio_calls():
                 "direction": direction,
             })
 
-        # ========= Override status con outcome de Studio si existe =========
         call_sids = [x.get("sid") for x in items if x.get("sid")]
         overrides = {}
         if call_sids:
@@ -640,7 +632,6 @@ def api_twilio_calls():
 
 @app.get("/download-results.csv")
 def download_results_csv():
-    # protect behind passcode
     fail = require_passcode(request.args.to_dict(flat=True))
     if fail:
         return fail
@@ -652,7 +643,6 @@ def download_results_csv():
 
     rows = q.limit(5000).all()
 
-    # Build CSV dynamically with union of question keys
     all_keys = set()
     parsed = []
     for r in rows:

@@ -109,7 +109,9 @@ class CallEvent(db.Model):
     campaign_id = db.Column(db.String(128), index=True, nullable=False)
     flow_sid = db.Column(db.String(64), index=True, nullable=True)
     execution_sid = db.Column(db.String(64), index=True, nullable=True)
-    call_sid = db.Column(db.String(64), index=True, unique=True, nullable=True)
+    # FIX: unique=True removed — no-answer calls have empty CallSid so multiple
+    # inserts would violate the constraint. We dedupe by execution_sid in code.
+    call_sid = db.Column(db.String(64), index=True, nullable=True)
     to_number = db.Column(db.String(32), index=True, nullable=True)
 
     # busy, no-answer, failed, completed
@@ -232,7 +234,9 @@ def normalize_outcome(v: str):
 
 
 def find_existing_call_event(call_sid: str, execution_sid: str):
-    existing = None
+    # FIX: treat empty strings as None — Studio sends "" for no-answer calls
+    call_sid = call_sid or None
+    execution_sid = execution_sid or None
 
     if call_sid:
         existing = CallEvent.query.filter(CallEvent.call_sid == call_sid).first()
@@ -371,8 +375,8 @@ def studio_webhook():
     campaign_id = (payload.get("campaignId") or payload.get("campaign_id") or "unknown").strip()
     flow_sid = (payload.get("flowSid") or payload.get("flow_sid") or "").strip()
     execution_sid = (payload.get("executionSid") or payload.get("execution_sid") or "").strip()
-    call_sid = (payload.get("callSid") or payload.get("CallSid") or "").strip()
-    to_number = (payload.get("to") or payload.get("To") or payload.get("contact") or "").strip()
+    call_sid = (payload.get("callSid") or payload.get("CallSid") or "").strip() or None
+    to_number = (payload.get("to") or payload.get("To") or payload.get("contact") or "").strip() or None
     raw_outcome = (payload.get("callOutcome") or payload.get("call_outcome") or "").strip()
 
     app.logger.info(
@@ -549,6 +553,16 @@ def api_launches():
 
     rows = q.limit(min(limit, 2000)).all()
 
+    # FIX: join outcomes from CallEvent so the frontend sees real status
+    execution_sids = [r.execution_sid for r in rows if r.execution_sid]
+    outcome_map = {}
+    if execution_sids:
+        events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
+        # if same execution has multiple events, prefer the latest
+        for e in events:
+            if e.execution_sid:
+                outcome_map[e.execution_sid] = e.outcome
+
     out = [{
         "id": r.id,
         "created_at": r.created_at.isoformat() if r.created_at else None,
@@ -557,6 +571,8 @@ def api_launches():
         "execution_sid": r.execution_sid,
         "to": r.to_number,
         "from": r.from_number,
+        # outcome: real status from CallEvent, or "pending" if not received yet
+        "outcome": outcome_map.get(r.execution_sid, "pending"),
     } for r in rows]
 
     return {"ok": True, "count": len(out), "launches": out}

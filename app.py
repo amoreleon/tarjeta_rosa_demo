@@ -275,7 +275,6 @@ def auth_check():
 
 def _launch_calls_background(app_ctx, campaign_id, flow_sid, from_number, to_numbers, extra_params):
     """Lanza llamadas en background thread para no bloquear Gunicorn."""
-    import threading
     sleep_between = (1.0 / CALLS_PER_SECOND) if (CALLS_PER_SECOND and CALLS_PER_SECOND > 0) else 1.0
 
     with app_ctx:
@@ -297,11 +296,11 @@ def _launch_calls_background(app_ctx, campaign_id, flow_sid, from_number, to_num
                 db.session.add(db_item)
                 db.session.commit()
             except Exception as e:
-                app.logger.error("background_call error to=%s: %s", to, e)
+                print(f"[background] error to={to}: {e}", flush=True)
 
             time.sleep(sleep_between)
 
-    app.logger.info("background campaign=%s finished total=%d", campaign_id, len(to_numbers))
+        print(f"[background] campaign={campaign_id} finished total={len(to_numbers)}", flush=True)
 
 
 @app.post("/call")

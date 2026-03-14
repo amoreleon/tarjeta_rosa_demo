@@ -273,6 +273,37 @@ def auth_check():
     return {"ok": True}
 
 
+def _launch_calls_background(app_ctx, campaign_id, flow_sid, from_number, to_numbers, extra_params):
+    """Lanza llamadas en background thread para no bloquear Gunicorn."""
+    import threading
+    sleep_between = (1.0 / CALLS_PER_SECOND) if (CALLS_PER_SECOND and CALLS_PER_SECOND > 0) else 1.0
+
+    with app_ctx:
+        for to in to_numbers:
+            try:
+                params = {"campaignId": campaign_id, **extra_params}
+                execution = twilio_client.studio.v2.flows(flow_sid).executions.create(
+                    to=to,
+                    from_=from_number,
+                    parameters=params
+                )
+                db_item = Launch(
+                    campaign_id=campaign_id,
+                    flow_sid=flow_sid,
+                    execution_sid=execution.sid,
+                    to_number=to,
+                    from_number=from_number
+                )
+                db.session.add(db_item)
+                db.session.commit()
+            except Exception as e:
+                app.logger.error("background_call error to=%s: %s", to, e)
+
+            time.sleep(sleep_between)
+
+    app.logger.info("background campaign=%s finished total=%d", campaign_id, len(to_numbers))
+
+
 @app.post("/call")
 def call():
     if not twilio_client:
@@ -315,50 +346,24 @@ def call():
     if MAX_CALLS_PER_REQUEST > 0 and len(to_numbers) > MAX_CALLS_PER_REQUEST:
         to_numbers = to_numbers[:MAX_CALLS_PER_REQUEST]
 
-    sleep_between = (1.0 / CALLS_PER_SECOND) if (CALLS_PER_SECOND and CALLS_PER_SECOND > 0) else 0
-
-    launched, failures = [], []
-
-    for to in to_numbers:
-        try:
-            params = {"campaignId": campaign_id, **extra_params}
-            execution = twilio_client.studio.v2.flows(flow_sid).executions.create(
-                to=to,
-                from_=from_number,
-                parameters=params
-            )
-
-            db_item = Launch(
-                campaign_id=campaign_id,
-                flow_sid=flow_sid,
-                execution_sid=execution.sid,
-                to_number=to,
-                from_number=from_number
-            )
-            db.session.add(db_item)
-            db.session.commit()
-
-            launched.append({
-                "to": to,
-                "execution_sid": execution.sid
-            })
-
-        except Exception as e:
-            failures.append({"to": to, "error": str(e)})
-
-        if sleep_between:
-            time.sleep(sleep_between)
+    # Lanzar en background — responde inmediatamente al frontend
+    import threading
+    ctx = app.app_context()
+    t = threading.Thread(
+        target=_launch_calls_background,
+        args=(ctx, campaign_id, flow_sid, from_number, to_numbers, extra_params),
+        daemon=True
+    )
+    t.start()
 
     return {
         "ok": True,
         "campaign_id": campaign_id,
         "flow_sid": flow_sid,
-        "launched_count": len(launched),
-        "failed_count": len(failures),
+        "queued_count": len(to_numbers),
         "invalid_count": len(invalid),
         "invalid_preview": invalid[:50],
-        "launched_preview": launched[:50],
-        "failures_preview": failures[:50],
+        "message": f"{len(to_numbers)} llamadas en proceso. Se lanzarán a {CALLS_PER_SECOND}/seg en background.",
     }
 
 

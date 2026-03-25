@@ -529,9 +529,9 @@ def flex_task_webhook():
     payload = request.form.to_dict(flat=True) or request.get_json(silent=True) or {}
 
     task_sid = payload.get("TaskSid", "")
-    event_type = payload.get("EventType", "")
+    event_type = (payload.get("EventType", "") or "").lower()
     worker_name = payload.get("WorkerName", "")
-    assignment_status = payload.get("TaskAssignmentStatus", "")
+    assignment_status = (payload.get("TaskAssignmentStatus", "") or "").lower()
 
     print(f"[flex-webhook] TaskSid={task_sid} Event={event_type} Status={assignment_status} Worker={worker_name}", flush=True)
 
@@ -542,10 +542,20 @@ def flex_task_webhook():
     if not task:
         return {"ok": True}
 
-    if assignment_status == "assigned":
+    # Manejar tanto EventType como TaskAssignmentStatus
+    is_assigned = (
+        assignment_status == "assigned"
+        or event_type in ("reservation.accepted", "task.assigned")
+    )
+    is_completed = (
+        assignment_status in ("completed", "canceled", "wrapping")
+        or event_type in ("task.completed", "task.canceled", "reservation.completed", "reservation.wrapup")
+    )
+
+    if is_assigned and task.status == "pending":
         task.status = "assigned"
-        task.worker_name = worker_name
-    elif assignment_status in ("completed", "canceled", "wrapping"):
+        task.worker_name = worker_name or task.worker_name
+    elif is_completed:
         task.status = "completed"
         task.completed_at = utcnow()
         task.worker_name = worker_name or task.worker_name

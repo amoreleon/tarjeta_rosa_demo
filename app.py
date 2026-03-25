@@ -4,6 +4,7 @@ import json
 import time
 import io
 import csv
+import threading
 from datetime import datetime, timezone
 
 from flask import Flask, request, render_template, send_file
@@ -26,20 +27,21 @@ DEFAULT_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
 DEMO_PASSCODE = (os.getenv("DEMO_PASSCODE", "") or "").strip()
 FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN", "") or "").strip()
 
-# Optional secret for Studio webhook (recommended once you get Studio access)
 STUDIO_WEBHOOK_SECRET = (os.getenv("STUDIO_WEBHOOK_SECRET", "") or "").strip()
 
 MAX_CALLS_PER_REQUEST = int(os.getenv("MAX_CALLS_PER_REQUEST", "1000"))
 CALLS_PER_SECOND = float(os.getenv("CALLS_PER_SECOND", "1"))
 
-# Render gives DATABASE_URL for Postgres if you configure it
+# Flex / TaskRouter
+TWILIO_WORKSPACE_SID = os.getenv("TWILIO_WORKSPACE_SID", "").strip()
+TWILIO_WORKFLOW_SID = os.getenv("TWILIO_WORKFLOW_SID", "WW002ca780443ec39460438835c4dc7bd1").strip()
+TWILIO_TASK_CHANNEL = os.getenv("TWILIO_TASK_CHANNEL", "voice").strip()
+
 DATABASE_URL = (os.getenv("DATABASE_URL", "") or "").strip()
 
-# SQLAlchemy expects "postgresql://", Render sometimes provides "postgres://"
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Fallback local DB if DATABASE_URL not set (useful for local dev)
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///local.db"
 
@@ -54,7 +56,6 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-# CORS for browser clients (Bolt/Lovable)
 cors_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else "*"
 CORS(
     app,
@@ -62,6 +63,7 @@ CORS(
         r"/call": {"origins": cors_origins},
         r"/auth-check": {"origins": cors_origins},
         r"/api/*": {"origins": cors_origins},
+        r"/flex-tasks": {"origins": cors_origins},
         r"/studio-webhook": {"origins": "*"},
     },
     methods=["GET", "POST", "OPTIONS"],
@@ -105,18 +107,26 @@ class CallEvent(db.Model):
     __tablename__ = "call_events"
     id = db.Column(db.Integer, primary_key=True)
     created_at = db.Column(db.DateTime(timezone=True), default=utcnow, index=True, nullable=False)
-
     campaign_id = db.Column(db.String(128), index=True, nullable=False)
     flow_sid = db.Column(db.String(64), index=True, nullable=True)
     execution_sid = db.Column(db.String(64), index=True, nullable=True)
-    # FIX: unique=True removed — no-answer calls have empty CallSid so multiple
-    # inserts would violate the constraint. We dedupe by execution_sid in code.
     call_sid = db.Column(db.String(64), index=True, nullable=True)
     to_number = db.Column(db.String(32), index=True, nullable=True)
-
-    # busy, no-answer, failed, completed
     outcome = db.Column(db.String(32), index=True, nullable=False)
     raw_json = db.Column(db.Text, nullable=False, default="{}")
+
+
+class FlexTask(db.Model):
+    __tablename__ = "flex_tasks"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime(timezone=True), default=utcnow, index=True, nullable=False)
+    campaign_id = db.Column(db.String(128), index=True, nullable=False)
+    to_number = db.Column(db.String(32), index=True, nullable=False)
+    task_sid = db.Column(db.String(64), index=True, nullable=True)
+    worker_name = db.Column(db.String(128), nullable=True)
+    # pending, assigned, completed, canceled
+    status = db.Column(db.String(32), index=True, nullable=False, default="pending")
+    completed_at = db.Column(db.DateTime(timezone=True), nullable=True)
 
 
 with app.app_context():
@@ -127,11 +137,6 @@ with app.app_context():
 # Helpers
 # =========================
 def require_passcode(payload: dict):
-    """
-    If DEMO_PASSCODE is set, require:
-      - payload.passcode  OR
-      - header X-CC-Passcode
-    """
     if not DEMO_PASSCODE:
         return None
     provided = (payload.get("passcode") or "").strip()
@@ -143,40 +148,23 @@ def require_passcode(payload: dict):
 
 
 def normalize_mx_number(value: str):
-    """
-    Accept Mexico-only inputs and normalize to E.164:
-      - 10 digits: 5512345678 -> +525512345678
-      - 12 digits starting with 52: 525512345678 -> +525512345678
-      - +52... also ok (we strip to digits then normalize)
-    """
     digits = re.sub(r"[^0-9]", "", str(value or ""))
     if not digits:
         return None
-
     if len(digits) == 10:
         digits = "52" + digits
-
     if len(digits) == 12 and digits.startswith("52"):
         return "+" + digits
-
     return None
 
 
 def parse_numbers(raw):
-    """
-    raw may be:
-      - string with lines
-      - list of strings
-    Returns (valid_e164_list, invalid_list)
-    """
     if raw is None:
         return [], []
-
     if isinstance(raw, list):
         lines = [str(x) for x in raw]
     else:
         lines = str(raw).splitlines()
-
     valid, invalid, seen = [], [], set()
     for line in lines:
         line = (line or "").strip()
@@ -189,7 +177,6 @@ def parse_numbers(raw):
         if norm not in seen:
             seen.add(norm)
             valid.append(norm)
-
     return valid, invalid
 
 
@@ -201,15 +188,9 @@ def safe_json(obj):
 
 
 def read_answers(payload: dict):
-    """
-    Flexible answers:
-      - preferred: payload["answers"] (dict)
-      - fallback: any keys like q1,q2,q3...
-    """
     answers = payload.get("answers")
     if isinstance(answers, dict):
         return answers
-
     out = {}
     for k, v in payload.items():
         if isinstance(k, str) and re.fullmatch(r"q\d+", k.strip().lower()):
@@ -219,7 +200,6 @@ def read_answers(payload: dict):
 
 def normalize_outcome(v: str):
     v = (v or "").strip().lower()
-
     if v in ("no_answer", "noanswer", "no-answer", "no answer"):
         return "no-answer"
     if v in ("busy",):
@@ -234,25 +214,21 @@ def normalize_outcome(v: str):
 
 
 def find_existing_call_event(call_sid: str, execution_sid: str):
-    # FIX: treat empty strings as None — Studio sends "" for no-answer calls
     call_sid = call_sid or None
     execution_sid = execution_sid or None
-
     if call_sid:
         existing = CallEvent.query.filter(CallEvent.call_sid == call_sid).first()
         if existing:
             return existing
-
     if execution_sid:
         existing = CallEvent.query.filter(CallEvent.execution_sid == execution_sid).first()
         if existing:
             return existing
-
     return None
 
 
 # =========================
-# Routes
+# Routes — Core
 # =========================
 @app.get("/")
 def index():
@@ -273,33 +249,29 @@ def auth_check():
     return {"ok": True}
 
 
+# =========================
+# Routes — IVR Outbound
+# =========================
 def _launch_calls_background(app_ctx, campaign_id, flow_sid, from_number, to_numbers, extra_params):
-    """Lanza llamadas en background thread para no bloquear Gunicorn."""
     sleep_between = (1.0 / CALLS_PER_SECOND) if (CALLS_PER_SECOND and CALLS_PER_SECOND > 0) else 1.0
-
     with app_ctx:
         for to in to_numbers:
             try:
                 params = {"campaignId": campaign_id, **extra_params}
                 execution = twilio_client.studio.v2.flows(flow_sid).executions.create(
-                    to=to,
-                    from_=from_number,
-                    parameters=params
+                    to=to, from_=from_number, parameters=params
                 )
-                db_item = Launch(
+                db.session.add(Launch(
                     campaign_id=campaign_id,
                     flow_sid=flow_sid,
                     execution_sid=execution.sid,
                     to_number=to,
                     from_number=from_number
-                )
-                db.session.add(db_item)
+                ))
                 db.session.commit()
             except Exception as e:
                 print(f"[background] error to={to}: {e}", flush=True)
-
             time.sleep(sleep_between)
-
         print(f"[background] campaign={campaign_id} finished total={len(to_numbers)}", flush=True)
 
 
@@ -317,12 +289,11 @@ def call():
     from_number = (payload.get("from_number") or payload.get("fromNumber") or DEFAULT_FROM_NUMBER or "").strip()
 
     if not flow_sid:
-        return {"ok": False, "error": "Falta flow_sid (TWILIO_STUDIO_FLOW_SID) o no se envió flow_sid."}, 400
+        return {"ok": False, "error": "Falta flow_sid."}, 400
     if not from_number:
-        return {"ok": False, "error": "Falta from_number (TWILIO_FROM_NUMBER)."}, 400
+        return {"ok": False, "error": "Falta from_number."}, 400
 
     campaign_id = (payload.get("campaign_id") or payload.get("campaignId") or "contact-center-v1").strip()
-
     extra_params = payload.get("extra_params") or payload.get("extraParams") or {}
     if isinstance(extra_params, str):
         try:
@@ -336,17 +307,11 @@ def call():
     to_numbers, invalid = parse_numbers(to_numbers_raw)
 
     if not to_numbers:
-        return {
-            "ok": False,
-            "error": "No hay números válidos. Usa teléfonos MX de 10 dígitos (ej. 5512345678).",
-            "invalid": invalid
-        }, 400
+        return {"ok": False, "error": "No hay números válidos.", "invalid": invalid}, 400
 
     if MAX_CALLS_PER_REQUEST > 0 and len(to_numbers) > MAX_CALLS_PER_REQUEST:
         to_numbers = to_numbers[:MAX_CALLS_PER_REQUEST]
 
-    # Lanzar en background — responde inmediatamente al frontend
-    import threading
     ctx = app.app_context()
     t = threading.Thread(
         target=_launch_calls_background,
@@ -374,7 +339,6 @@ def studio_webhook():
             return {"ok": False, "error": "Unauthorized"}, 401
 
     payload = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
-
     event = (payload.get("event") or "").strip().lower()
     campaign_id = (payload.get("campaignId") or payload.get("campaign_id") or "unknown").strip()
     flow_sid = (payload.get("flowSid") or payload.get("flow_sid") or "").strip()
@@ -383,22 +347,11 @@ def studio_webhook():
     to_number = (payload.get("to") or payload.get("To") or payload.get("contact") or "").strip() or None
     raw_outcome = (payload.get("callOutcome") or payload.get("call_outcome") or "").strip()
 
-    app.logger.info(
-        "studio_webhook event=%s campaign=%s flow=%s execution=%s call=%s to=%s outcome=%s",
-        event,
-        campaign_id,
-        flow_sid,
-        execution_sid,
-        call_sid,
-        to_number,
-        raw_outcome,
-    )
+    app.logger.info("studio_webhook event=%s campaign=%s call=%s", event, campaign_id, call_sid)
 
-    # 1) call_result
     if event == "call_result":
         call_outcome = normalize_outcome(raw_outcome)
         existing = find_existing_call_event(call_sid, execution_sid)
-
         if existing:
             existing.outcome = call_outcome
             existing.raw_json = safe_json(payload)
@@ -410,35 +363,22 @@ def studio_webhook():
                 existing.call_sid = call_sid
         else:
             db.session.add(CallEvent(
-                campaign_id=campaign_id,
-                flow_sid=flow_sid or None,
-                execution_sid=execution_sid or None,
-                call_sid=call_sid or None,
-                to_number=to_number or None,
-                outcome=call_outcome,
-                raw_json=safe_json(payload),
+                campaign_id=campaign_id, flow_sid=flow_sid or None,
+                execution_sid=execution_sid or None, call_sid=call_sid or None,
+                to_number=to_number or None, outcome=call_outcome, raw_json=safe_json(payload),
             ))
-
         db.session.commit()
         return {"ok": True}
 
-    # 2) survey_result (o legado sin event)
     answers = read_answers(payload)
-
-    row = Result(
-        campaign_id=campaign_id,
-        flow_sid=flow_sid or None,
-        execution_sid=execution_sid or None,
-        call_sid=call_sid or None,
-        to_number=to_number or None,
-        answers_json=safe_json(answers),
-        raw_json=safe_json(payload),
-    )
-    db.session.add(row)
+    db.session.add(Result(
+        campaign_id=campaign_id, flow_sid=flow_sid or None,
+        execution_sid=execution_sid or None, call_sid=call_sid or None,
+        to_number=to_number or None, answers_json=safe_json(answers), raw_json=safe_json(payload),
+    ))
 
     survey_outcome = normalize_outcome(raw_outcome or "completed")
     existing = find_existing_call_event(call_sid, execution_sid)
-
     if existing:
         existing.outcome = survey_outcome
         existing.raw_json = safe_json(payload)
@@ -450,19 +390,173 @@ def studio_webhook():
             existing.call_sid = call_sid
     else:
         db.session.add(CallEvent(
-            campaign_id=campaign_id,
-            flow_sid=flow_sid or None,
-            execution_sid=execution_sid or None,
-            call_sid=call_sid or None,
-            to_number=to_number or None,
-            outcome=survey_outcome,
-            raw_json=safe_json(payload),
+            campaign_id=campaign_id, flow_sid=flow_sid or None,
+            execution_sid=execution_sid or None, call_sid=call_sid or None,
+            to_number=to_number or None, outcome=survey_outcome, raw_json=safe_json(payload),
         ))
+    db.session.commit()
+    return {"ok": True}
+
+
+# =========================
+# Routes — Flex Task Queue
+# =========================
+def _create_flex_tasks_background(app_ctx, campaign_id, to_numbers):
+    """Crea Tasks en TaskRouter para cola de agentes Flex."""
+    with app_ctx:
+        created = 0
+        errors = 0
+        for to in to_numbers:
+            try:
+                attributes = json.dumps({
+                    "phone": to,
+                    "campaign_id": campaign_id,
+                    "type": "outbound",
+                    "name": to,
+                })
+                task = twilio_client.taskrouter.v1.workspaces(TWILIO_WORKSPACE_SID).tasks.create(
+                    attributes=attributes,
+                    workflow_sid=TWILIO_WORKFLOW_SID,
+                    task_channel=TWILIO_TASK_CHANNEL,
+                    timeout=86400  # 24 horas máximo en cola
+                )
+                db.session.add(FlexTask(
+                    campaign_id=campaign_id,
+                    to_number=to,
+                    task_sid=task.sid,
+                    status="pending"
+                ))
+                db.session.commit()
+                created += 1
+            except Exception as e:
+                print(f"[flex-tasks] error to={to}: {e}", flush=True)
+                errors += 1
+            time.sleep(0.1)  # 10 tasks/seg
+        print(f"[flex-tasks] campaign={campaign_id} created={created} errors={errors}", flush=True)
+
+
+@app.post("/flex-tasks")
+def create_flex_tasks():
+    """Crea tareas en Flex TaskRouter para marcación saliente con agente."""
+    if not twilio_client:
+        return {"ok": False, "error": "Twilio no configurado."}, 500
+    if not TWILIO_WORKSPACE_SID:
+        return {"ok": False, "error": "Falta TWILIO_WORKSPACE_SID en variables de entorno."}, 500
+
+    payload = request.get_json(silent=True) or {}
+    fail = require_passcode(payload)
+    if fail:
+        return fail
+
+    campaign_id = (payload.get("campaign_id") or payload.get("campaignId") or "flex-campaign").strip()
+    to_numbers_raw = payload.get("to_numbers") or payload.get("toNumbers") or ""
+    to_numbers, invalid = parse_numbers(to_numbers_raw)
+
+    if not to_numbers:
+        return {"ok": False, "error": "No hay números válidos.", "invalid": invalid}, 400
+
+    if MAX_CALLS_PER_REQUEST > 0 and len(to_numbers) > MAX_CALLS_PER_REQUEST:
+        to_numbers = to_numbers[:MAX_CALLS_PER_REQUEST]
+
+    ctx = app.app_context()
+    t = threading.Thread(
+        target=_create_flex_tasks_background,
+        args=(ctx, campaign_id, to_numbers),
+        daemon=True
+    )
+    t.start()
+
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "queued_count": len(to_numbers),
+        "invalid_count": len(invalid),
+        "message": f"{len(to_numbers)} tareas creándose en cola de Flex.",
+    }
+
+
+@app.get("/api/flex-tasks")
+def get_flex_tasks():
+    """Lista tareas Flex con estatus."""
+    fail = require_passcode(request.args.to_dict())
+    if fail:
+        return fail
+
+    campaign_id = (request.args.get("campaign_id") or "").strip()
+    status_filter = (request.args.get("status") or "").strip()
+    limit = int(request.args.get("limit", 200))
+
+    q = FlexTask.query
+    if campaign_id:
+        q = q.filter(FlexTask.campaign_id == campaign_id)
+    if status_filter:
+        q = q.filter(FlexTask.status == status_filter)
+    tasks = q.order_by(FlexTask.created_at.desc()).limit(limit).all()
+
+    result = []
+    for t in tasks:
+        result.append({
+            "id": t.id,
+            "campaign_id": t.campaign_id,
+            "to_number": t.to_number,
+            "task_sid": t.task_sid,
+            "status": t.status,
+            "worker_name": t.worker_name,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+        })
+
+    total = len(result)
+    pending = sum(1 for r in result if r["status"] == "pending")
+    assigned = sum(1 for r in result if r["status"] == "assigned")
+    completed = sum(1 for r in result if r["status"] in ("completed", "canceled"))
+
+    return {
+        "ok": True,
+        "tasks": result,
+        "summary": {
+            "total": total,
+            "pending": pending,
+            "assigned": assigned,
+            "completed": completed,
+        }
+    }
+
+
+@app.post("/api/flex-tasks/webhook")
+def flex_task_webhook():
+    """TaskRouter webhook — actualiza estatus de tareas cuando Twilio notifica."""
+    payload = request.form.to_dict(flat=True) or request.get_json(silent=True) or {}
+
+    task_sid = payload.get("TaskSid", "")
+    event_type = payload.get("EventType", "")
+    worker_name = payload.get("WorkerName", "")
+    assignment_status = payload.get("TaskAssignmentStatus", "")
+
+    print(f"[flex-webhook] TaskSid={task_sid} Event={event_type} Status={assignment_status} Worker={worker_name}", flush=True)
+
+    if not task_sid:
+        return {"ok": True}
+
+    task = FlexTask.query.filter_by(task_sid=task_sid).first()
+    if not task:
+        return {"ok": True}
+
+    if assignment_status == "assigned":
+        task.status = "assigned"
+        task.worker_name = worker_name
+    elif assignment_status in ("completed", "canceled", "wrapping"):
+        task.status = "completed"
+        task.completed_at = utcnow()
+        task.worker_name = worker_name or task.worker_name
 
     db.session.commit()
     return {"ok": True}
 
 
+# =========================
+# Routes — API consultas
+# =========================
 @app.get("/api/results")
 def api_results():
     fail = require_passcode(request.args.to_dict(flat=True))
@@ -480,7 +574,6 @@ def api_results():
         q = q.filter(Result.flow_sid == flow_sid)
 
     rows = q.limit(min(limit, 1000)).all()
-
     out = []
     for r in rows:
         try:
@@ -497,7 +590,6 @@ def api_results():
             "to": r.to_number,
             "answers": answers,
         })
-
     return {"ok": True, "count": len(out), "results": out}
 
 
@@ -517,10 +609,8 @@ def api_summary():
         q = q.filter(Result.flow_sid == flow_sid)
 
     rows = q.all()
-
     summary = {}
     total = 0
-
     for r in rows:
         total += 1
         try:
@@ -529,7 +619,6 @@ def api_summary():
             answers = {}
         if not isinstance(answers, dict):
             continue
-
         for k, v in answers.items():
             k = str(k).lower()
             v = str(v)
@@ -557,12 +646,10 @@ def api_launches():
 
     rows = q.limit(min(limit, 2000)).all()
 
-    # FIX: join outcomes from CallEvent so the frontend sees real status
     execution_sids = [r.execution_sid for r in rows if r.execution_sid]
     outcome_map = {}
     if execution_sids:
         events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
-        # if same execution has multiple events, prefer the latest
         for e in events:
             if e.execution_sid:
                 outcome_map[e.execution_sid] = e.outcome
@@ -575,7 +662,6 @@ def api_launches():
         "execution_sid": r.execution_sid,
         "to": r.to_number,
         "from": r.from_number,
-        # outcome: real status from CallEvent, or "pending" if not received yet
         "outcome": outcome_map.get(r.execution_sid, "pending"),
     } for r in rows]
 
@@ -608,7 +694,6 @@ def api_twilio_calls():
 
         for c in calls:
             direction = pick_attr(c, "direction") or ""
-
             if not include_inbound and direction_filter:
                 if direction != direction_filter:
                     continue
@@ -618,7 +703,6 @@ def api_twilio_calls():
                 or (DEFAULT_FROM_NUMBER if direction == "outbound-api" else None)
             )
             to_val = pick_attr(c, "to", "to_formatted")
-
             start_time = pick_attr(c, "start_time")
             end_time = pick_attr(c, "end_time")
 
@@ -638,20 +722,16 @@ def api_twilio_calls():
 
         overrides = {}
         campaign_map = {}
-
-        # Primary lookup: CallEvent by call_sid
         if call_sids:
             ce_rows = CallEvent.query.filter(CallEvent.call_sid.in_(call_sids)).all()
             overrides = {r.call_sid: r.outcome for r in ce_rows if r.call_sid and r.outcome}
             campaign_map = {r.call_sid: r.campaign_id for r in ce_rows if r.call_sid and r.campaign_id}
 
-        # Lookup 2: Result by call_sid (llamadas completadas con encuesta)
         result_campaign_map = {}
         if call_sids:
             res_rows = Result.query.filter(Result.call_sid.in_(call_sids)).all()
             result_campaign_map = {r.call_sid: r.campaign_id for r in res_rows if r.call_sid and r.campaign_id}
 
-        # Lookup 3: Launch by to_number (fallback cuando call_sid no existe)
         launch_campaign_by_to = {}
         if to_numbers:
             launch_rows = (
@@ -668,7 +748,6 @@ def api_twilio_calls():
             sid = x.get("sid")
             if sid and sid in overrides:
                 x["status"] = overrides[sid]
-            # Prioridad: CallEvent -> Result -> Launch por to_number
             campaign_id = (
                 (campaign_map.get(sid, "") if sid else "")
                 or (result_campaign_map.get(sid, "") if sid else "")
@@ -682,6 +761,9 @@ def api_twilio_calls():
         return {"ok": False, "error": str(e)}, 500
 
 
+# =========================
+# Routes — Exports
+# =========================
 @app.get("/download-results.csv")
 def download_results_csv():
     fail = require_passcode(request.args.to_dict(flat=True))
@@ -694,7 +776,6 @@ def download_results_csv():
         q = q.filter(Result.campaign_id == campaign_id)
 
     rows = q.limit(5000).all()
-
     all_keys = set()
     parsed = []
     for r in rows:
@@ -708,21 +789,15 @@ def download_results_csv():
         parsed.append((r, answers))
 
     qkeys = sorted([str(k) for k in all_keys])
-
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["created_at", "campaign_id", "flow_sid", "execution_sid", "call_sid", "to"] + qkeys)
-
     for r, answers in parsed:
-        row = [
+        writer.writerow([
             r.created_at.isoformat() if r.created_at else "",
-            r.campaign_id,
-            r.flow_sid or "",
-            r.execution_sid or "",
-            r.call_sid or "",
-            r.to_number or "",
-        ] + [answers.get(k, "") for k in qkeys]
-        writer.writerow(row)
+            r.campaign_id, r.flow_sid or "", r.execution_sid or "",
+            r.call_sid or "", r.to_number or "",
+        ] + [answers.get(k, "") for k in qkeys])
 
     mem = io.BytesIO(output.getvalue().encode("utf-8"))
     mem.seek(0)
@@ -750,8 +825,8 @@ def download_launches_csv():
         q = q.filter(Launch.campaign_id == campaign_id)
 
     rows = q.limit(10000).all()
-
     execution_sids = [r.execution_sid for r in rows if r.execution_sid]
+
     outcome_map = {}
     if execution_sids:
         events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
@@ -795,7 +870,6 @@ def download_launches_csv():
         wb = Workbook()
         ws = wb.active
         ws.title = "Historial"
-
         header_fill = PatternFill("solid", start_color="1F4E79")
         header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
         for col_idx, h in enumerate(headers, 1):
@@ -809,21 +883,13 @@ def download_launches_csv():
             if r.created_at:
                 mx_time = r.created_at - timedelta(hours=6)
                 fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
-
             estatus = outcome_map.get(r.execution_sid, "pendiente")
             duracion = duration_map.get(r.execution_sid, "")
             ans = answers_map.get(r.execution_sid, {})
-
             row_data = [
-                fecha,
-                r.campaign_id,
-                r.from_number or "",
-                r.to_number or "",
-                estatus,
-                duracion,
-                r.execution_sid or "",
+                fecha, r.campaign_id, r.from_number or "", r.to_number or "",
+                estatus, duracion, r.execution_sid or "",
             ] + [ans.get(k, "") for k in qkeys]
-
             for col_idx, val in enumerate(row_data, 1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=str(val) if val != "" else "")
                 cell.font = Font(name="Arial", size=10)
@@ -841,7 +907,6 @@ def download_launches_csv():
         return send_file(mem, as_attachment=True, download_name=fname,
                          mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # Fallback CSV
     from datetime import timedelta
     output = io.StringIO()
     writer = csv.writer(output)

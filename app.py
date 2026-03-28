@@ -774,11 +774,16 @@ def api_twilio_calls():
 # =========================
 # Routes — Exports
 # =========================
-@app.get("/download-results.csv")
-def download_results_csv():
+@app.get("/download-results.xlsx")
+def download_results_xlsx():
     fail = require_passcode(request.args.to_dict(flat=True))
     if fail:
         return fail
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from datetime import timedelta
 
     campaign_id = (request.args.get("campaign_id") or "").strip()
     q = Result.query.order_by(Result.created_at.desc())
@@ -799,19 +804,60 @@ def download_results_csv():
         parsed.append((r, answers))
 
     qkeys = sorted([str(k) for k in all_keys])
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["created_at", "campaign_id", "flow_sid", "execution_sid", "call_sid", "to"] + qkeys)
-    for r, answers in parsed:
-        writer.writerow([
-            r.created_at.isoformat() if r.created_at else "",
-            r.campaign_id, r.flow_sid or "", r.execution_sid or "",
-            r.call_sid or "", r.to_number or "",
-        ] + [answers.get(k, "") for k in qkeys])
+    headers = ["Fecha", "Campaign ID", "Teléfono", "Flow SID", "Execution SID"] + qkeys
 
-    mem = io.BytesIO(output.getvalue().encode("utf-8"))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resultados"
+    header_fill = PatternFill("solid", start_color="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row_idx, (r, answers) in enumerate(parsed, 2):
+        fecha = ""
+        if r.created_at:
+            mx_time = r.created_at - timedelta(hours=6)
+            fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
+        row_data = [
+            fecha, r.campaign_id or "", r.to_number or "",
+            r.flow_sid or "", r.execution_sid or "",
+        ] + [answers.get(k, "") for k in qkeys]
+        for col_idx, val in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=str(val) if val != "" else "")
+            cell.font = Font(name="Arial", size=10)
+            if col_idx == 3:
+                cell.number_format = "@"
+
+    col_widths = [22, 18, 18, 36, 36] + [14] * len(qkeys)
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    mem = io.BytesIO()
+    wb.save(mem)
     mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name="results.csv", mimetype="text/csv")
+    fname = "results_{}.xlsx".format(campaign_id or "all")
+    return send_file(mem, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def translate_status(outcome, answers):
+    if not outcome or outcome in ("no-answer", "no_answer"):
+        return "No contestó"
+    if outcome == "busy":
+        return "Ocupado"
+    if outcome == "failed":
+        return "Fallida"
+    if outcome == "completed":
+        if not answers:
+            return "No contestó"
+        values = list(answers.values())
+        all_empty = all(not v or v.strip() == "" or v == "Sin respuesta" for v in values)
+        return "No contestó" if all_empty else "Completada"
+    return "No contestó"
 
 
 @app.get("/download-launches.csv")
@@ -893,7 +939,7 @@ def download_launches_csv():
             if r.created_at:
                 mx_time = r.created_at - timedelta(hours=6)
                 fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
-            estatus = outcome_map.get(r.execution_sid, "pendiente")
+            estatus = translate_status(outcome_map.get(r.execution_sid), answers_map.get(r.execution_sid, {}))
             duracion = duration_map.get(r.execution_sid, "")
             ans = answers_map.get(r.execution_sid, {})
             row_data = [
@@ -926,9 +972,9 @@ def download_launches_csv():
         if r.created_at:
             mx_time = r.created_at - timedelta(hours=6)
             fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
-        estatus = outcome_map.get(r.execution_sid, "pendiente")
-        duracion = duration_map.get(r.execution_sid, "")
         ans = answers_map.get(r.execution_sid, {})
+        estatus = translate_status(outcome_map.get(r.execution_sid), ans)
+        duracion = duration_map.get(r.execution_sid, "")
         writer.writerow([
             fecha, r.campaign_id, r.from_number or "", r.to_number or "",
             estatus, duracion, r.execution_sid or "",

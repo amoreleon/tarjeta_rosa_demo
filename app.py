@@ -742,6 +742,17 @@ def api_twilio_calls():
             res_rows = Result.query.filter(Result.call_sid.in_(call_sids)).all()
             result_campaign_map = {r.call_sid: r.campaign_id for r in res_rows if r.call_sid and r.campaign_id}
 
+        # Cruzar answers por call_sid
+        answers_by_call_sid = {}
+        if call_sids:
+            res_rows_answers = Result.query.filter(Result.call_sid.in_(call_sids)).all()
+            for r in res_rows_answers:
+                if r.call_sid:
+                    try:
+                        answers_by_call_sid[r.call_sid] = json.loads(r.answers_json or "{}")
+                    except Exception:
+                        answers_by_call_sid[r.call_sid] = {}
+
         launch_campaign_by_to = {}
         if to_numbers:
             launch_rows = (
@@ -764,6 +775,7 @@ def api_twilio_calls():
                 or launch_campaign_by_to.get(x.get("to"), "")
             )
             x["campaign_id"] = campaign_id
+            x["answers"] = answers_by_call_sid.get(sid, {})
 
         return {"ok": True, "count": len(items), "calls": items}
 

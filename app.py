@@ -699,7 +699,14 @@ def api_twilio_calls():
         return None
 
     try:
-        calls = twilio_client.calls.list(limit=min(limit, 200))
+        kwargs = {"limit": min(limit, 200)}
+        date_from = request.args.get("date_from", "").strip()
+        date_to = request.args.get("date_to", "").strip()
+        if date_from:
+            kwargs["start_time_after"] = datetime.strptime(date_from, "%Y-%m-%d")
+        if date_to:
+            kwargs["start_time_before"] = datetime.strptime(date_to, "%Y-%m-%d")
+        calls = twilio_client.calls.list(**kwargs)
         items = []
 
         for c in calls:

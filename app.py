@@ -213,6 +213,55 @@ def normalize_outcome(v: str):
     return v or "unknown"
 
 
+def clasificar_estado(outcome, duration=None, answers=None, audio_duration=30):
+    """
+    Clasifica el estado de una llamada de forma legible para el usuario.
+    outcome: string de Twilio (completed, no-answer, busy, failed, canceled, etc.)
+    duration: duración en segundos (int o None)
+    answers: dict de respuestas IVR o None
+    audio_duration: duración estimada del audio en segundos (default 30)
+    """
+    outcome = (outcome or "").strip().lower()
+    answers = answers or {}
+    has_answers = bool(answers) and any(
+        v and str(v).strip() and str(v).strip().lower() != "sin respuesta"
+        for v in answers.values()
+    )
+
+    try:
+        dur = int(duration) if duration not in (None, "", "None") else None
+    except (ValueError, TypeError):
+        dur = None
+
+    if outcome in ("no-answer", "no_answer", "noanswer"):
+        return "No contestó"
+    if outcome == "busy":
+        return "Ocupado"
+    if outcome == "failed":
+        return "Falló"
+    if outcome == "canceled":
+        return "Cancelada"
+    if outcome == "completed":
+        if has_answers:
+            return "Completó encuesta"
+        if dur is not None:
+            if dur >= (audio_duration - 5):
+                return "Posible buzón"
+            if dur >= 5:
+                return "Contestó sin participar"
+            return "Colgó rápido"
+        return "Contestó sin participar"
+    # pending o desconocido
+    return "Sin resultado"
+
+
+# Estados que vale la pena relanzar
+ESTADOS_RELANZAR = {
+    "No contestó", "Ocupado", "Posible buzón",
+    "Contestó sin participar", "Colgó rápido", "Sin resultado"
+}
+
+
 def find_existing_call_event(call_sid: str, execution_sid: str):
     call_sid = call_sid or None
     execution_sid = execution_sid or None
@@ -658,11 +707,33 @@ def api_launches():
 
     execution_sids = [r.execution_sid for r in rows if r.execution_sid]
     outcome_map = {}
+    answers_map_launches = {}
+    call_sid_map_launches = {}
+
     if execution_sids:
         events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
         for e in events:
             if e.execution_sid:
                 outcome_map[e.execution_sid] = e.outcome
+                if e.call_sid:
+                    call_sid_map_launches[e.execution_sid] = e.call_sid
+        res_rows = Result.query.filter(Result.execution_sid.in_(execution_sids)).all()
+        for res in res_rows:
+            try:
+                ans = json.loads(res.answers_json or "{}")
+            except Exception:
+                ans = {}
+            if isinstance(ans, dict):
+                answers_map_launches[res.execution_sid] = ans
+
+    duration_map_launches = {}
+    if twilio_client and call_sid_map_launches:
+        for exec_sid, csid in call_sid_map_launches.items():
+            try:
+                call = twilio_client.calls(csid).fetch()
+                duration_map_launches[exec_sid] = int(call.duration or 0)
+            except Exception:
+                duration_map_launches[exec_sid] = None
 
     out = [{
         "id": r.id,
@@ -672,7 +743,11 @@ def api_launches():
         "execution_sid": r.execution_sid,
         "to": r.to_number,
         "from": r.from_number,
-        "outcome": outcome_map.get(r.execution_sid, "pending"),
+        "outcome": clasificar_estado(
+            outcome_map.get(r.execution_sid),
+            duration_map_launches.get(r.execution_sid),
+            answers_map_launches.get(r.execution_sid, {})
+        ),
     } for r in rows]
 
     return {"ok": True, "count": len(out), "launches": out}
@@ -772,17 +847,36 @@ def api_twilio_calls():
                 if lr.to_number and lr.to_number not in launch_campaign_by_to:
                     launch_campaign_by_to[lr.to_number] = lr.campaign_id
 
+        # Obtener duraciones desde Twilio para clasificación inteligente
+        duration_by_sid = {}
+        if twilio_client and call_sids:
+            for csid in call_sids:
+                try:
+                    call = twilio_client.calls(csid).fetch()
+                    duration_by_sid[csid] = int(call.duration or 0)
+                except Exception:
+                    duration_by_sid[csid] = None
+
         for x in items:
             sid = x.get("sid")
-            if sid and sid in overrides:
-                x["status"] = overrides[sid]
+            raw_outcome = overrides.get(sid) if sid else None
+            answers = answers_by_call_sid.get(sid, {})
+            duration = duration_by_sid.get(sid)
+
+            # Aplicar clasificación inteligente
+            x["status"] = clasificar_estado(
+                raw_outcome or x.get("status"),
+                duration,
+                answers
+            )
             campaign_id = (
                 (campaign_map.get(sid, "") if sid else "")
                 or (result_campaign_map.get(sid, "") if sid else "")
                 or launch_campaign_by_to.get(x.get("to"), "")
             )
             x["campaign_id"] = campaign_id
-            x["answers"] = answers_by_call_sid.get(sid, {})
+            x["answers"] = answers
+            x["duration"] = duration
 
         return {"ok": True, "count": len(items), "calls": items}
 
@@ -860,6 +954,122 @@ def download_results_xlsx():
     wb.save(mem)
     mem.seek(0)
     fname = "results_{}.xlsx".format(campaign_id or "all")
+    return send_file(mem, as_attachment=True, download_name=fname,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/download-retry-list.xlsx")
+def download_retry_list():
+    """Exporta números no exitosos listos para relanzar."""
+    fail = require_passcode(request.args.to_dict(flat=True))
+    if fail:
+        return fail
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from datetime import timedelta
+
+    campaign_id = (request.args.get("campaign_id") or "").strip()
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+
+    q = Launch.query.order_by(Launch.created_at.desc())
+    if campaign_id:
+        q = q.filter(Launch.campaign_id == campaign_id)
+    if date_from:
+        try:
+            q = q.filter(Launch.created_at >= datetime.strptime(date_from, "%Y-%m-%d"))
+        except Exception:
+            pass
+    if date_to:
+        try:
+            q = q.filter(Launch.created_at <= datetime.strptime(date_to, "%Y-%m-%d"))
+        except Exception:
+            pass
+
+    rows = q.limit(10000).all()
+    execution_sids = [r.execution_sid for r in rows if r.execution_sid]
+
+    outcome_map = {}
+    answers_map = {}
+    call_sid_map = {}
+
+    if execution_sids:
+        events = CallEvent.query.filter(CallEvent.execution_sid.in_(execution_sids)).all()
+        for e in events:
+            if e.execution_sid:
+                outcome_map[e.execution_sid] = e.outcome
+                if e.call_sid:
+                    call_sid_map[e.execution_sid] = e.call_sid
+        res_rows = Result.query.filter(Result.execution_sid.in_(execution_sids)).all()
+        for res in res_rows:
+            try:
+                ans = json.loads(res.answers_json or "{}")
+            except Exception:
+                ans = {}
+            if isinstance(ans, dict):
+                answers_map[res.execution_sid] = ans
+
+    duration_map = {}
+    if twilio_client and call_sid_map:
+        for exec_sid, csid in call_sid_map.items():
+            try:
+                call = twilio_client.calls(csid).fetch()
+                duration_map[exec_sid] = int(call.duration or 0)
+            except Exception:
+                duration_map[exec_sid] = None
+
+    retry_rows = []
+    for r in rows:
+        estado = clasificar_estado(
+            outcome_map.get(r.execution_sid),
+            duration_map.get(r.execution_sid),
+            answers_map.get(r.execution_sid, {})
+        )
+        if estado in ESTADOS_RELANZAR:
+            retry_rows.append((r, estado))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Numeros a Relanzar"
+
+    ws.merge_cells("A1:D1")
+    nota = ws.cell(row=1, column=1,
+        value="INSTRUCCIONES: Copia la columna A (Telefono) y pegala en Outbound para relanzar. Agrega -RETRY-1 al Campaign ID.")
+    nota.font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    nota.fill = PatternFill("solid", start_color="1F7A4A")
+    nota.alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[1].height = 30
+
+    headers = ["Telefono", "Motivo no exitosa", "Fecha del intento", "Campaign ID"]
+    header_fill = PatternFill("solid", start_color="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=2, column=col_idx, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row_idx, (r, estado) in enumerate(retry_rows, 3):
+        fecha = ""
+        if r.created_at:
+            mx_time = r.created_at - timedelta(hours=6)
+            fecha = mx_time.strftime("%d/%m/%Y %H:%M")
+        c1 = ws.cell(row=row_idx, column=1, value=str(r.to_number or ""))
+        c1.font = Font(name="Arial", size=10)
+        c1.number_format = "@"
+        ws.cell(row=row_idx, column=2, value=estado).font = Font(name="Arial", size=10)
+        ws.cell(row=row_idx, column=3, value=fecha).font = Font(name="Arial", size=10)
+        ws.cell(row=row_idx, column=4, value=r.campaign_id or "").font = Font(name="Arial", size=10)
+
+    for i, w in enumerate([20, 28, 22, 25], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    mem = io.BytesIO()
+    wb.save(mem)
+    mem.seek(0)
+    fname = "relanzar_{}.xlsx".format(campaign_id or "all")
     return send_file(mem, as_attachment=True, download_name=fname,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -959,7 +1169,7 @@ def download_launches_csv():
             if r.created_at:
                 mx_time = r.created_at - timedelta(hours=6)
                 fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
-            estatus = translate_status(outcome_map.get(r.execution_sid), answers_map.get(r.execution_sid, {}))
+            estatus = clasificar_estado(outcome_map.get(r.execution_sid), duration_map.get(r.execution_sid), answers_map.get(r.execution_sid, {}))
             duracion = duration_map.get(r.execution_sid, "")
             ans = answers_map.get(r.execution_sid, {})
             row_data = [
@@ -993,7 +1203,7 @@ def download_launches_csv():
             mx_time = r.created_at - timedelta(hours=6)
             fecha = mx_time.strftime("%d/%m/%Y %H:%M:%S")
         ans = answers_map.get(r.execution_sid, {})
-        estatus = translate_status(outcome_map.get(r.execution_sid), ans)
+        estatus = clasificar_estado(outcome_map.get(r.execution_sid), duration_map.get(r.execution_sid), ans)
         duracion = duration_map.get(r.execution_sid, "")
         writer.writerow([
             fecha, r.campaign_id, r.from_number or "", r.to_number or "",

@@ -823,7 +823,8 @@ def download_results_xlsx():
         parsed.append((r, answers))
 
     qkeys = sorted([str(k) for k in all_keys])
-    headers = ["Fecha", "Campaign ID", "Teléfono", "Flow SID", "Execution SID"] + qkeys
+    pregunta_headers = [f"Pregunta {k[1:]}" if str(k).startswith("q") and str(k)[1:].isdigit() else str(k) for k in qkeys]
+    headers = ["Fecha", "Campaign ID", "Teléfono", "Flow SID", "Execution SID"] + pregunta_headers
 
     wb = Workbook()
     ws = wb.active

@@ -252,6 +252,7 @@ def clasificar_estado(outcome, duration=None, answers=None, audio_duration=30):
             return "Colgó rápido"
         return "Contestó sin participar"
     # pending o desconocido
+    print(f"[clasificar] outcome={outcome!r} dur={dur} answers={answers} has_answers={has_answers}", flush=True)
     return "Sin resultado"
 
 

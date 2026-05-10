@@ -778,6 +778,8 @@ def api_twilio_calls():
         kwargs = {"limit": min(limit, 200)}
         date_from = request.args.get("date_from", "").strip()
         date_to = request.args.get("date_to", "").strip()
+        if date_from and not re.match(r'^\d{4}-\d{2}-\d{2}$', date_from):
+            date_from = ''
         if date_from:
             kwargs["start_time_after"] = datetime.strptime(date_from, "%Y-%m-%d")
         if date_to:
@@ -828,6 +830,7 @@ def api_twilio_calls():
         # Cruzar answers por call_sid
         answers_by_call_sid = {}
         if call_sids:
+            print(f"[debug] call_sids a buscar: {call_sids[:5]}", flush=True)
             res_rows_answers = Result.query.filter(Result.call_sid.in_(call_sids)).all()
             for r in res_rows_answers:
                 if r.call_sid:
@@ -835,6 +838,7 @@ def api_twilio_calls():
                         answers_by_call_sid[r.call_sid] = json.loads(r.answers_json or "{}")
                     except Exception:
                         answers_by_call_sid[r.call_sid] = {}
+            print(f"[debug] answers_by_call_sid keys: {list(answers_by_call_sid.keys())[:5]}", flush=True)
 
         launch_campaign_by_to = {}
         if to_numbers:
@@ -850,6 +854,7 @@ def api_twilio_calls():
 
         for x in items:
             sid = x.get("sid")
+            print(f"[debug] sid={sid} answers={answers_by_call_sid.get(sid, 'NO ENCONTRADO')}", flush=True)
             twilio_status = x.get("status")
             raw_outcome = overrides.get(sid) if sid else twilio_status
             answers = answers_by_call_sid.get(sid, {})

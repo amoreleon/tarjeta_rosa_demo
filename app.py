@@ -805,7 +805,7 @@ def api_twilio_calls():
                 "status": pick_attr(c, "status"),
                 "start_time": start_time.isoformat() if start_time else None,
                 "end_time": end_time.isoformat() if end_time else None,
-                "duration": pick_attr(c, "duration"),
+                "duration": int(c.duration or 0) if c.duration else None,
                 "direction": direction,
             })
 
@@ -847,25 +847,15 @@ def api_twilio_calls():
                 if lr.to_number and lr.to_number not in launch_campaign_by_to:
                     launch_campaign_by_to[lr.to_number] = lr.campaign_id
 
-        # Obtener duraciones desde Twilio para clasificación inteligente
-        duration_by_sid = {}
-        if twilio_client and call_sids:
-            for csid in call_sids:
-                try:
-                    call = twilio_client.calls(csid).fetch()
-                    duration_by_sid[csid] = int(call.duration or 0)
-                except Exception:
-                    duration_by_sid[csid] = None
-
         for x in items:
             sid = x.get("sid")
-            raw_outcome = overrides.get(sid) if sid else None
+            twilio_status = x.get("status")
+            raw_outcome = overrides.get(sid) if sid else twilio_status
             answers = answers_by_call_sid.get(sid, {})
-            duration = duration_by_sid.get(sid)
+            duration = x.get("duration")
 
-            # Aplicar clasificación inteligente
             x["status"] = clasificar_estado(
-                raw_outcome or x.get("status"),
+                raw_outcome or twilio_status,
                 duration,
                 answers
             )
